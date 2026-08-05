@@ -602,6 +602,8 @@ def register_lakeflow_source(spark):
     FULL_REFRESH_PAGE_SIZE = 100
     BATCH_READ_PROPERTY_CHUNK_SIZE = 100
     UPDATED_AT_EXCLUSIVE_OFFSET_KEY = "_updatedAt_exclusive"
+    PIPELINE_OBJECT_TYPES = ("deals", "tickets")
+    PIPELINES_TABLE_SUFFIX = "_pipelines"
 
 
     class HubspotLakeflowConnect(LakeflowConnect):
@@ -702,8 +704,40 @@ def register_lakeflow_source(spark):
                 "cursor_field": "updatedAt",
                 "cursor_property_field": "hs_lastmodifieddate",
                 "associations": [],
-                "supports_deletes": False,  # Custom objects don't support archived queries by default
+                "supports_deletes": False,
+                # Custom objects don't support archived queries by default.
             }
+            self._pipeline_object_types = self._discover_pipeline_object_types()
+
+        def _discover_pipeline_object_types(self) -> List[str]:
+            """Return CRM object types that expose the HubSpot pipelines API."""
+            available_types = list(PIPELINE_OBJECT_TYPES)
+
+            try:
+                for custom_object in self._discover_custom_objects():
+                    try:
+                        self._fetch_pipelines(custom_object)
+                        available_types.append(custom_object)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # Preserve order while removing duplicates.
+            return list(dict.fromkeys(available_types))
+
+        @staticmethod
+        def _is_pipelines_table(table_name: str) -> bool:
+            return table_name.endswith(PIPELINES_TABLE_SUFFIX)
+
+        @staticmethod
+        def _pipeline_table_name(object_type: str) -> str:
+            return f"{object_type}{PIPELINES_TABLE_SUFFIX}"
+
+        def _get_pipeline_object_type(self, table_name: str) -> str:
+            if not self._is_pipelines_table(table_name):
+                raise ValueError(f"Table is not a pipelines table: {table_name}")
+            return table_name[: -len(PIPELINES_TABLE_SUFFIX)]
 
         @staticmethod
         def _get_updated_at_offset_state(
@@ -751,6 +785,10 @@ def register_lakeflow_source(spark):
                 "tasks",
                 "notes",
             ]
+            standard_tables.extend(
+                self._pipeline_table_name(object_type)
+                for object_type in self._pipeline_object_types
+            )
 
             # Add dynamic discovery of custom objects
             try:
@@ -849,13 +887,8 @@ def register_lakeflow_source(spark):
                 table_name: The name of the table to fetch the metadata for.
 
             Returns:
-                A dictionary containing the metadata of the table. It includes the following keys:
-                    - primary_keys: The name of the primary key columns of the table.
-                    - cursor_field: The name of the field to use as a cursor for incremental loading.
-                    - ingestion_type: The type of ingestion to use for the table. It should be one of:
-                        - "snapshot": For snapshot loading.
-                        - "cdc": capture incremental changes
-                        - "append": incremental append
+                A dictionary containing table metadata such as primary keys,
+                cursor field, and ingestion type.
             """
             supported_tables = self.list_tables()
             if table_name not in supported_tables:
@@ -886,6 +919,9 @@ def register_lakeflow_source(spark):
             Returns:
                 StructType representing the table schema
             """
+            if self._is_pipelines_table(table_name):
+                return self._discover_pipeline_schema()
+
             # All CRM objects follow the same schema pattern
             return self._discover_crm_object_schema(table_name)
 
@@ -893,6 +929,14 @@ def register_lakeflow_source(spark):
             """
             Get metadata for a table based on object configuration.
             """
+            if self._is_pipelines_table(table_name):
+                object_type = self._get_pipeline_object_type(table_name)
+                return {
+                    "primary_keys": ["pipelineId"],
+                    "object_type": object_type,
+                    "ingestion_type": "snapshot",
+                }
+
             config = self._get_object_config(table_name)
 
             # Get property names and cursor property field for API calls
@@ -911,6 +955,41 @@ def register_lakeflow_source(spark):
                 "associations": config.get("associations", []),
                 "ingestion_type": ingestion_type,
             }
+
+        @staticmethod
+        def _discover_pipeline_schema() -> StructType:
+            stage_metadata_schema = StructType(
+                [
+                    StructField("isClosed", StringType(), True),
+                    StructField("probability", StringType(), True),
+                    StructField("ticketState", StringType(), True),
+                ]
+            )
+            stage_schema = StructType(
+                [
+                    StructField("stageId", StringType(), True),
+                    StructField("label", StringType(), True),
+                    StructField("displayOrder", LongType(), True),
+                    StructField("active", BooleanType(), True),
+                    StructField("createdAt", StringType(), True),
+                    StructField("updatedAt", StringType(), True),
+                    StructField("metadata", stage_metadata_schema, True),
+                ]
+            )
+            return StructType(
+                [
+                    StructField("pipelineId", StringType(), True),
+                    StructField("objectType", StringType(), True),
+                    StructField("objectTypeId", StringType(), True),
+                    StructField("label", StringType(), True),
+                    StructField("displayOrder", LongType(), True),
+                    StructField("active", BooleanType(), True),
+                    StructField("default", BooleanType(), True),
+                    StructField("createdAt", StringType(), True),
+                    StructField("updatedAt", StringType(), True),
+                    StructField("stages", ArrayType(stage_schema), True),
+                ]
+            )
 
         def _discover_crm_object_schema(self, table_name: str) -> StructType:
             """
@@ -941,12 +1020,13 @@ def register_lakeflow_source(spark):
                     prop_name = prop.get("name", "")
                     prop_type = prop.get("type", "string")
 
-                    # Map HubSpot property types to Spark types
                     spark_type = self._map_hubspot_type_to_spark(prop_type)
                     properties_fields.append(StructField(prop_name, spark_type, True))
 
             # Create nested properties StructType
-            properties_struct = StructType(properties_fields) if properties_fields else StructType([])
+            properties_struct = (
+                StructType(properties_fields) if properties_fields else StructType([])
+            )
 
             # Add properties as a nested field
             base_fields.append(StructField("properties", properties_struct, True))
@@ -991,10 +1071,10 @@ def register_lakeflow_source(spark):
             type_mapping = {
                 "string": StringType(),
                 "enumeration": StringType(),
-                "bool": BooleanType(),  # Keep boolean as boolean for better data handling
+                "bool": BooleanType(),
                 "number": LongType(),
-                "date": StringType(),  # Store as string to preserve ISO format
-                "date-time": StringType(),  # Store as string to preserve ISO format
+                "date": StringType(),
+                "date-time": StringType(),
                 "datetime": StringType(),
                 "json": StringType(),
                 "phone_number": StringType(),
@@ -1025,6 +1105,9 @@ def register_lakeflow_source(spark):
                 )
 
             # Determine if this is an incremental read
+            if self._is_pipelines_table(table_name):
+                return self._read_pipeline_table(table_name)
+
             is_incremental = (
                 start_offset is not None and start_offset.get("updatedAt") is not None
             )
@@ -1035,6 +1118,12 @@ def register_lakeflow_source(spark):
                 incremental=is_incremental,
                 table_options=table_options,
             )
+
+        def _read_pipeline_table(self, table_name: str) -> (Iterator[dict], dict):
+            """Read snapshot pipeline metadata for a HubSpot object type."""
+            object_type = self._get_pipeline_object_type(table_name)
+            records = self._fetch_pipelines(object_type)
+            return [self._transform_pipeline_record(record) for record in records], {}
 
         def read_table_deletes(
             self, table_name: str, start_offset: dict, table_options: Dict[str, str]
@@ -1309,6 +1398,20 @@ def register_lakeflow_source(spark):
 
             return records, next_after
 
+        def _fetch_pipelines(self, object_type: str) -> List[Dict]:
+            """Fetch pipeline metadata for a supported HubSpot object type."""
+            url = f"{self.base_url}/crm-pipelines/v1/pipelines/{object_type}"
+            params = {"includeInactive": "EXCLUDE_DELETED"}
+            resp = requests.get(
+                url, headers=self.auth_header, params=params, timeout=60
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"HubSpot pipelines API error for {object_type}: "
+                    f"{resp.status_code} {resp.text}"
+                )
+            return resp.json().get("results", [])
+
         def _hydrate_record_properties(
             self, table_name: str, records: List[Dict], property_names: List[str]
         ) -> List[Dict]:
@@ -1453,6 +1556,74 @@ def register_lakeflow_source(spark):
             transformed_record.update(self._extract_associations(record, table_name))
 
             return transformed_record
+
+        def _transform_pipeline_record(self, record: Dict) -> Dict:
+            """Normalize HubSpot pipeline metadata into a stable snapshot row."""
+            transformed = {
+                "pipelineId": str(record.get("pipelineId", "")) or None,
+                "objectType": record.get("objectType"),
+                "objectTypeId": record.get("objectTypeId"),
+                "label": record.get("label"),
+                "displayOrder": record.get("displayOrder"),
+                "active": record.get("active"),
+                "default": record.get("default"),
+                "createdAt": self._normalize_pipeline_timestamp(record.get("createdAt")),
+                "updatedAt": self._normalize_pipeline_timestamp(record.get("updatedAt")),
+                "stages": [],
+            }
+            for stage in record.get("stages", []) or []:
+                transformed["stages"].append(
+                    {
+                        "stageId": str(stage.get("stageId", "")) or None,
+                        "label": stage.get("label"),
+                        "displayOrder": stage.get("displayOrder"),
+                        "active": stage.get("active"),
+                        "createdAt": self._normalize_pipeline_timestamp(
+                            stage.get("createdAt")
+                        ),
+                        "updatedAt": self._normalize_pipeline_timestamp(
+                            stage.get("updatedAt")
+                        ),
+                        "metadata": {
+                            "isClosed": self._stringify_optional(
+                                (stage.get("metadata") or {}).get("isClosed")
+                            ),
+                            "probability": self._stringify_optional(
+                                (stage.get("metadata") or {}).get("probability")
+                            ),
+                            "ticketState": self._stringify_optional(
+                                (stage.get("metadata") or {}).get("ticketState")
+                            ),
+                        },
+                    }
+                )
+            return transformed
+
+        @staticmethod
+        def _normalize_pipeline_timestamp(value) -> str | None:
+            """Convert HubSpot millisecond or ISO timestamps into ISO-8601 UTC."""
+            if value in (None, ""):
+                return None
+            if isinstance(value, (int, float)):
+                return (
+                    datetime.fromtimestamp(value / 1000, timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+                    + "Z"
+                )
+            value_str = str(value)
+            if value_str.isdigit():
+                return (
+                    datetime.fromtimestamp(int(value_str) / 1000, timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+                    + "Z"
+                )
+            return value_str
+
+        @staticmethod
+        def _stringify_optional(value) -> str | None:
+            if value in (None, ""):
+                return None
+            return str(value)
 
         def _sanitize_properties(self, properties: Dict) -> Dict:
             """Convert empty strings to None in properties dict.
