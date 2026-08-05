@@ -1,7 +1,6 @@
-import json
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List
 
 import requests
 from pyspark.sql.types import (
@@ -15,6 +14,8 @@ from pyspark.sql.types import (
 )
 
 from databricks.labs.community_connector.interface import LakeflowConnect
+
+UPDATED_AT_EXCLUSIVE_OFFSET_KEY = "_updatedAt_exclusive"
 
 
 class HubspotLakeflowConnect(LakeflowConnect):
@@ -117,6 +118,30 @@ class HubspotLakeflowConnect(LakeflowConnect):
             "associations": [],
             "supports_deletes": False,  # Custom objects don't support archived queries by default
         }
+
+    @staticmethod
+    def _get_updated_at_offset_state(
+        start_offset: dict | None,
+    ) -> tuple[str | None, bool]:
+        """Return the checkpoint timestamp and whether it is exclusive."""
+        if not start_offset:
+            return None, False
+        return (
+            start_offset.get("updatedAt"),
+            bool(start_offset.get(UPDATED_AT_EXCLUSIVE_OFFSET_KEY)),
+        )
+
+    @staticmethod
+    def _build_updated_at_offset(
+        updated_at: str | None, exclusive: bool = False
+    ) -> dict:
+        """Build the incremental checkpoint payload for HubSpot reads."""
+        if not updated_at:
+            return {}
+        offset = {"updatedAt": updated_at}
+        if exclusive:
+            offset[UPDATED_AT_EXCLUSIVE_OFFSET_KEY] = True
+        return offset
 
     def list_tables(self) -> list[str]:
         """
@@ -540,8 +565,12 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         all_records = []
         after = None
-        checkpoint = start_offset.get("updatedAt") if start_offset else None
+        checkpoint, checkpoint_is_exclusive = self._get_updated_at_offset_state(
+            start_offset
+        )
         latest_updated = checkpoint
+        stop_after_current_page = False
+        drain_boundary_updated_at = None
 
         while True:
             if incremental:
@@ -550,7 +579,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     table_name,
                     property_names,
                     cursor_property_field,
-                    start_offset,
+                    checkpoint,
+                    checkpoint_is_exclusive,
                     after,
                 )
                 if updated_time and (
@@ -566,22 +596,58 @@ class HubspotLakeflowConnect(LakeflowConnect):
             if not records:
                 break
 
-            # Transform records
-            transformed_records = self._transform_records(records, table_name)
+            if incremental:
+                transformed_records = []
+                for raw_record in records:
+                    if (
+                        max_records is not None
+                        and drain_boundary_updated_at is None
+                        and len(all_records) + len(transformed_records) >= max_records
+                    ):
+                        drain_boundary_updated_at = latest_updated
+
+                    updated_at = raw_record.get("updatedAt")
+                    if (
+                        drain_boundary_updated_at is not None
+                        and updated_at
+                        and updated_at > drain_boundary_updated_at
+                    ):
+                        stop_after_current_page = True
+                        break
+
+                    transformed = self._transform_single_record(raw_record, table_name)
+                    transformed_records.append(transformed)
+                    if updated_at and (
+                        not latest_updated or updated_at > latest_updated
+                    ):
+                        latest_updated = updated_at
+            else:
+                # Transform records
+                transformed_records = self._transform_records(records, table_name)
+
+                # Update latest timestamp
+                for record in transformed_records:
+                    updated_at = record.get("updatedAt")
+                    if updated_at and (
+                        not latest_updated or updated_at > latest_updated
+                    ):
+                        latest_updated = updated_at
+
             all_records.extend(transformed_records)
 
-            # Update latest timestamp
-            for record in transformed_records:
-                updated_at = record.get("updatedAt")
-                if updated_at and (not latest_updated or updated_at > latest_updated):
-                    latest_updated = updated_at
+            if stop_after_current_page:
+                break
 
             if not after:
                 break
 
             # Stop if we've hit the per-microbatch record cap. The next
             # microbatch resumes from latest_updated via the cursor filter.
-            if max_records is not None and len(all_records) >= max_records:
+            if (
+                max_records is not None
+                and len(all_records) >= max_records
+                and drain_boundary_updated_at is None
+            ):
                 break
 
             # Rate limiting
@@ -592,7 +658,11 @@ class HubspotLakeflowConnect(LakeflowConnect):
         if incremental and latest_updated and latest_updated > self._init_ts:
             latest_updated = self._init_ts
 
-        offset = {"updatedAt": latest_updated} if latest_updated else {}
+        offset = (
+            self._build_updated_at_offset(latest_updated, exclusive=incremental)
+            if latest_updated
+            else {}
+        )
         return all_records, offset
 
     def _fetch_full_refresh_batch(
@@ -631,11 +701,12 @@ class HubspotLakeflowConnect(LakeflowConnect):
         table_name: str,
         property_names: List[str],
         cursor_property_field: str,
-        start_offset: dict,
+        checkpoint: str | None,
+        checkpoint_is_exclusive: bool,
         after: str = None,
     ):
         """Fetch a batch of records using incremental search API"""
-        last_updated = start_offset.get("updatedAt", "1970-01-01T00:00:00.000Z")
+        last_updated = checkpoint or "1970-01-01T00:00:00.000Z"
 
         # Convert to milliseconds for HubSpot
         try:
@@ -643,7 +714,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp()
                 * 1000
             )
-        except:
+        except Exception:
             last_updated_ms = 0
 
         search_body = {
@@ -652,7 +723,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     "filters": [
                         {
                             "propertyName": cursor_property_field,
-                            "operator": "GTE",
+                            "operator": (
+                                "GT" if checkpoint_is_exclusive else "GTE"
+                            ),
                             "value": str(last_updated_ms),
                         }
                     ]
