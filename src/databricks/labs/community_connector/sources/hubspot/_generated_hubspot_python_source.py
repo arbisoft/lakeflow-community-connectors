@@ -599,6 +599,8 @@ def register_lakeflow_source(spark):
     # src/databricks/labs/community_connector/sources/hubspot/hubspot.py
     ########################################################
 
+    FULL_REFRESH_PAGE_SIZE = 100
+    BATCH_READ_PROPERTY_CHUNK_SIZE = 100
     UPDATED_AT_EXCLUSIVE_OFFSET_KEY = "_updatedAt_exclusive"
 
 
@@ -726,6 +728,12 @@ def register_lakeflow_source(spark):
             if exclusive:
                 offset[UPDATED_AT_EXCLUSIVE_OFFSET_KEY] = True
             return offset
+
+        @staticmethod
+        def _chunk_list(values: List[str], chunk_size: int) -> Iterator[List[str]]:
+            """Yield stable slices of ``values`` no larger than ``chunk_size``."""
+            for start in range(0, len(values), chunk_size):
+                yield values[start:start + chunk_size]
 
         def list_tables(self) -> list[str]:
             """
@@ -1257,18 +1265,39 @@ def register_lakeflow_source(spark):
             after: str = None,
             archived: bool = False,
         ):
-            """Fetch a batch of records using full refresh API"""
-            archived_param = "true" if archived else "false"
-            url = f"{self.base_url}/crm/v3/objects/{table_name}?limit=100&archived={archived_param}"
+            """Fetch a full-refresh page without large property query strings."""
+            records, next_after = self._list_full_refresh_page(
+                table_name, associations, after=after, archived=archived
+            )
+            if not records or archived or not property_names:
+                return records, next_after
 
+            hydrated_records = self._hydrate_record_properties(
+                table_name, records, property_names
+            )
+            return hydrated_records, next_after
+
+        def _list_full_refresh_page(
+            self,
+            table_name: str,
+            associations: List[str],
+            after: str = None,
+            archived: bool = False,
+        ):
+            """List one page of objects with compact query parameters."""
+            url = f"{self.base_url}/crm/v3/objects/{table_name}"
+            params = {
+                "limit": str(FULL_REFRESH_PAGE_SIZE),
+                "archived": "true" if archived else "false",
+            }
             if after:
-                url += f"&after={after}"
-            if property_names:
-                url += f"&properties={','.join(property_names)}"
+                params["after"] = after
             if associations:
-                url += f"&associations={','.join(associations)}"
+                params["associations"] = ",".join(associations)
 
-            resp = requests.get(url, headers=self.auth_header, timeout=60)
+            resp = requests.get(
+                url, headers=self.auth_header, params=params, timeout=60
+            )
             if resp.status_code != 200:
                 raise Exception(
                     f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
@@ -1279,6 +1308,62 @@ def register_lakeflow_source(spark):
             next_after = data.get("paging", {}).get("next", {}).get("after")
 
             return records, next_after
+
+        def _hydrate_record_properties(
+            self, table_name: str, records: List[Dict], property_names: List[str]
+        ) -> List[Dict]:
+            """Attach full property payloads via batch-read POST calls."""
+            if not records or not property_names:
+                return records
+
+            record_ids = [str(record["id"]) for record in records if record.get("id")]
+            if not record_ids:
+                return records
+
+            properties_by_id = {record_id: {} for record_id in record_ids}
+            for property_chunk in self._chunk_list(
+                property_names, BATCH_READ_PROPERTY_CHUNK_SIZE
+            ):
+                batch_results = self._batch_read_properties(
+                    table_name, record_ids, property_chunk
+                )
+                for batch_record in batch_results:
+                    record_id = str(batch_record.get("id", ""))
+                    if not record_id:
+                        continue
+                    properties_by_id.setdefault(record_id, {}).update(
+                        batch_record.get("properties", {}) or {}
+                    )
+
+            hydrated_records = []
+            for record in records:
+                record_id = str(record.get("id", ""))
+                merged = dict(record)
+                merged["properties"] = properties_by_id.get(record_id, {})
+                hydrated_records.append(merged)
+            return hydrated_records
+
+        def _batch_read_properties(
+            self, table_name: str, record_ids: List[str], property_names: List[str]
+        ) -> List[Dict]:
+            """Read object properties via POST body so large schemas avoid URI limits."""
+            if not record_ids or not property_names:
+                return []
+
+            url = f"{self.base_url}/crm/v3/objects/{table_name}/batch/read"
+            payload = {
+                "inputs": [{"id": record_id} for record_id in record_ids],
+                "properties": property_names,
+            }
+            resp = requests.post(
+                url, headers=self.auth_header, json=payload, timeout=60
+            )
+            if resp.status_code != 200:
+                raise Exception(
+                    "HubSpot batch read API error for "
+                    f"{table_name}: {resp.status_code} {resp.text}"
+                )
+            return resp.json().get("results", [])
 
         def _fetch_incremental_batch(
             self,
