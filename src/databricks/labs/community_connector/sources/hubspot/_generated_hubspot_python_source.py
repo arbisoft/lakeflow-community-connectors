@@ -605,6 +605,25 @@ def register_lakeflow_source(spark):
     PIPELINE_OBJECT_TYPES = ("deals", "tickets")
     PIPELINES_TABLE_SUFFIX = "_pipelines"
 
+    # Stage-propagation history: one row per stage transition for a deal/ticket
+    # moving through its pipeline. HubSpot uses a different "current stage"
+    # property name per object type.
+    STAGE_HISTORY_TABLE_SUFFIX = "_stage_history"
+    STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE = {
+        "deals": "dealstage",
+        "tickets": "hs_pipeline_stage",
+    }
+    # HubSpot's batch/read endpoint caps `propertiesWithHistory` requests at 50
+    # inputs per call -- lower than the 100-item cap on plain property batch
+    # reads used elsewhere in this connector.
+    STAGE_HISTORY_BATCH_SIZE = 50
+
+    # Owners: HubSpot's user directory (deal/ticket/company owners). This is a
+    # dedicated API (crm/v3/owners), not a CRM object with properties, so it
+    # gets a single fixed-name snapshot table rather than one per object type.
+    OWNERS_TABLE_NAME = "owners"
+    OWNERS_PAGE_SIZE = 100
+
 
     class HubspotLakeflowConnect(LakeflowConnect):
         def __init__(self, options: dict) -> None:
@@ -708,6 +727,11 @@ def register_lakeflow_source(spark):
                 # Custom objects don't support archived queries by default.
             }
             self._pipeline_object_types = self._discover_pipeline_object_types()
+            self._stage_history_object_types = [
+                object_type
+                for object_type in self._pipeline_object_types
+                if object_type in STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE
+            ]
 
         def _discover_pipeline_object_types(self) -> List[str]:
             """Return CRM object types that expose the HubSpot pipelines API."""
@@ -738,6 +762,22 @@ def register_lakeflow_source(spark):
             if not self._is_pipelines_table(table_name):
                 raise ValueError(f"Table is not a pipelines table: {table_name}")
             return table_name[: -len(PIPELINES_TABLE_SUFFIX)]
+
+        @staticmethod
+        def _is_stage_history_table(table_name: str) -> bool:
+            if not table_name.endswith(STAGE_HISTORY_TABLE_SUFFIX):
+                return False
+            object_type = table_name[: -len(STAGE_HISTORY_TABLE_SUFFIX)]
+            return object_type in STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE
+
+        @staticmethod
+        def _stage_history_table_name(object_type: str) -> str:
+            return f"{object_type}{STAGE_HISTORY_TABLE_SUFFIX}"
+
+        def _get_stage_history_object_type(self, table_name: str) -> str:
+            if not self._is_stage_history_table(table_name):
+                raise ValueError(f"Table is not a stage history table: {table_name}")
+            return table_name[: -len(STAGE_HISTORY_TABLE_SUFFIX)]
 
         @staticmethod
         def _get_updated_at_offset_state(
@@ -789,6 +829,11 @@ def register_lakeflow_source(spark):
                 self._pipeline_table_name(object_type)
                 for object_type in self._pipeline_object_types
             )
+            standard_tables.extend(
+                self._stage_history_table_name(object_type)
+                for object_type in self._stage_history_object_types
+            )
+            standard_tables.append(OWNERS_TABLE_NAME)
 
             # Add dynamic discovery of custom objects
             try:
@@ -922,6 +967,12 @@ def register_lakeflow_source(spark):
             if self._is_pipelines_table(table_name):
                 return self._discover_pipeline_schema()
 
+            if self._is_stage_history_table(table_name):
+                return self._discover_stage_history_schema()
+
+            if table_name == OWNERS_TABLE_NAME:
+                return self._discover_owners_schema()
+
             # All CRM objects follow the same schema pattern
             return self._discover_crm_object_schema(table_name)
 
@@ -934,6 +985,23 @@ def register_lakeflow_source(spark):
                 return {
                     "primary_keys": ["pipelineId"],
                     "object_type": object_type,
+                    "ingestion_type": "snapshot",
+                }
+
+            if self._is_stage_history_table(table_name):
+                object_type = self._get_stage_history_object_type(table_name)
+                base_config = self._get_object_config(object_type)
+                return {
+                    "primary_keys": ["objectId", "stageId", "enteredAt"],
+                    "cursor_field": "enteredAt",
+                    "cursor_property_field": base_config["cursor_property_field"],
+                    "object_type": object_type,
+                    "ingestion_type": "cdc",
+                }
+
+            if table_name == OWNERS_TABLE_NAME:
+                return {
+                    "primary_keys": ["ownerId"],
                     "ingestion_type": "snapshot",
                 }
 
@@ -988,6 +1056,47 @@ def register_lakeflow_source(spark):
                     StructField("createdAt", StringType(), True),
                     StructField("updatedAt", StringType(), True),
                     StructField("stages", ArrayType(stage_schema), True),
+                ]
+            )
+
+        @staticmethod
+        def _discover_stage_history_schema() -> StructType:
+            return StructType(
+                [
+                    StructField("objectId", StringType(), True),
+                    StructField("objectType", StringType(), True),
+                    StructField("pipelineId", StringType(), True),
+                    StructField("stageId", StringType(), True),
+                    StructField("stageLabel", StringType(), True),
+                    StructField("enteredAt", StringType(), True),
+                    StructField("sourceType", StringType(), True),
+                    StructField("sourceId", StringType(), True),
+                    StructField("updatedByUserId", StringType(), True),
+                    StructField("isCurrentStage", BooleanType(), True),
+                ]
+            )
+
+        @staticmethod
+        def _discover_owners_schema() -> StructType:
+            team_schema = StructType(
+                [
+                    StructField("id", StringType(), True),
+                    StructField("name", StringType(), True),
+                    StructField("primary", BooleanType(), True),
+                ]
+            )
+            return StructType(
+                [
+                    StructField("ownerId", StringType(), True),
+                    StructField("email", StringType(), True),
+                    StructField("firstName", StringType(), True),
+                    StructField("lastName", StringType(), True),
+                    StructField("userId", StringType(), True),
+                    StructField("userIdIncludingInactive", StringType(), True),
+                    StructField("archived", BooleanType(), True),
+                    StructField("createdAt", StringType(), True),
+                    StructField("updatedAt", StringType(), True),
+                    StructField("teams", ArrayType(team_schema), True),
                 ]
             )
 
@@ -1108,6 +1217,14 @@ def register_lakeflow_source(spark):
             if self._is_pipelines_table(table_name):
                 return self._read_pipeline_table(table_name)
 
+            if self._is_stage_history_table(table_name):
+                return self._read_stage_history_table(
+                    table_name, start_offset, table_options
+                )
+
+            if table_name == OWNERS_TABLE_NAME:
+                return self._read_owners_table()
+
             is_incremental = (
                 start_offset is not None and start_offset.get("updatedAt") is not None
             )
@@ -1124,6 +1241,205 @@ def register_lakeflow_source(spark):
             object_type = self._get_pipeline_object_type(table_name)
             records = self._fetch_pipelines(object_type)
             return [self._transform_pipeline_record(record) for record in records], {}
+
+        def _read_owners_table(self) -> (Iterator[dict], dict):
+            """Read snapshot owner (user directory) metadata."""
+            records = self._fetch_owners()
+            return [self._transform_owner_record(record) for record in records], {}
+
+        def _fetch_owners(self) -> List[Dict]:
+            """Fetch all HubSpot owners, paginating through the owners API."""
+            url = f"{self.base_url}/crm/v3/owners/"
+            all_owners = []
+            after = None
+
+            while True:
+                params = {"limit": str(OWNERS_PAGE_SIZE)}
+                if after:
+                    params["after"] = after
+
+                resp = requests.get(url, headers=self.auth_header, params=params, timeout=60)
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"HubSpot owners API error: {resp.status_code} {resp.text}"
+                    )
+
+                data = resp.json()
+                all_owners.extend(data.get("results", []))
+                after = data.get("paging", {}).get("next", {}).get("after")
+                if not after:
+                    break
+                time.sleep(0.1)
+
+            return all_owners
+
+        def _transform_owner_record(self, record: Dict) -> Dict:
+            """Normalize a HubSpot owner into a stable snapshot row."""
+            teams = []
+            for team in record.get("teams", []) or []:
+                teams.append(
+                    {
+                        "id": self._stringify_optional(team.get("id")),
+                        "name": team.get("name"),
+                        "primary": team.get("primary"),
+                    }
+                )
+            return {
+                "ownerId": str(record.get("id", "")) or None,
+                "email": record.get("email"),
+                "firstName": record.get("firstName"),
+                "lastName": record.get("lastName"),
+                "userId": self._stringify_optional(record.get("userId")),
+                "userIdIncludingInactive": self._stringify_optional(
+                    record.get("userIdIncludingInactive")
+                ),
+                "archived": record.get("archived"),
+                "createdAt": self._normalize_pipeline_timestamp(record.get("createdAt")),
+                "updatedAt": self._normalize_pipeline_timestamp(record.get("updatedAt")),
+                "teams": teams,
+            }
+
+        def _read_stage_history_table(
+            self, table_name: str, start_offset: dict, table_options: Dict[str, str]
+        ) -> (Iterator[dict], dict):
+            """
+            Emit one row per stage transition for deals/tickets moving through a
+            pipeline.
+
+            Reuses the underlying object's own incremental cursor (updatedAt /
+            hs_lastmodifieddate) to find which deals/tickets changed since the
+            last checkpoint -- a stage change always bumps that cursor -- then
+            hydrates each changed record's full stage history via the batch/read
+            `propertiesWithHistory` API.
+
+            Because a record's *entire* stage history is re-fetched whenever any
+            of its properties change (not just the stage), the same transition
+            can be re-emitted on a later run. That's fine: the primary key
+            (objectId, stageId, enteredAt) makes re-emission idempotent under
+            cdc upsert semantics.
+            """
+            object_type = self._get_stage_history_object_type(table_name)
+            stage_property = STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE[object_type]
+
+            is_incremental = (
+                start_offset is not None and start_offset.get("updatedAt") is not None
+            )
+
+            # Reuse the object's own read path: gives us exactly the set of
+            # deals/tickets that changed since the last checkpoint, plus a
+            # correctly capped offset we can hand straight back to the framework.
+            changed_records, offset = self._read_data(
+                object_type,
+                start_offset,
+                incremental=is_incremental,
+                table_options=table_options,
+            )
+
+            if not changed_records:
+                return [], offset
+
+            stage_lookup = self._build_stage_lookup(object_type)
+
+            history_rows = []
+            record_ids = [
+                str(record["id"]) for record in changed_records if record.get("id")
+            ]
+            for id_chunk in self._chunk_list(record_ids, STAGE_HISTORY_BATCH_SIZE):
+                history_by_id = self._fetch_stage_history_batch(
+                    object_type, id_chunk, stage_property
+                )
+                for object_id, transitions in history_by_id.items():
+                    history_rows.extend(
+                        self._transform_stage_history_transitions(
+                            object_id, object_type, transitions, stage_lookup
+                        )
+                    )
+
+            return history_rows, offset
+
+        def _fetch_stage_history_batch(
+            self, object_type: str, record_ids: List[str], stage_property: str
+        ) -> Dict[str, List[Dict]]:
+            """
+            Batch-read the full historical values of `stage_property` for a set
+            of records.
+
+            Returns {objectId: [ {value, timestamp, sourceType, sourceId,
+            updatedByUserId}, ... ]} -- HubSpot returns these newest-first.
+            """
+            if not record_ids:
+                return {}
+
+            url = f"{self.base_url}/crm/v3/objects/{object_type}/batch/read"
+            payload = {
+                "inputs": [{"id": record_id} for record_id in record_ids],
+                "propertiesWithHistory": [stage_property],
+            }
+            resp = requests.post(url, headers=self.auth_header, json=payload, timeout=60)
+            if resp.status_code != 200:
+                raise Exception(
+                    "HubSpot stage-history batch read error for "
+                    f"{object_type}: {resp.status_code} {resp.text}"
+                )
+
+            history_by_id = {}
+            for record in resp.json().get("results", []):
+                object_id = str(record.get("id", ""))
+                if not object_id:
+                    continue
+                property_history = record.get("propertiesWithHistory", {}) or {}
+                history_by_id[object_id] = property_history.get(stage_property, []) or []
+            return history_by_id
+
+        def _build_stage_lookup(self, object_type: str) -> Dict[str, tuple]:
+            """Map stageId -> (pipelineId, stageLabel) for a given object type."""
+            lookup = {}
+            try:
+                pipelines = self._fetch_pipelines(object_type)
+            except Exception:
+                return lookup
+            for pipeline in pipelines:
+                pipeline_id = str(pipeline.get("pipelineId", ""))
+                for stage in pipeline.get("stages", []) or []:
+                    stage_id = str(stage.get("stageId", ""))
+                    if stage_id:
+                        lookup[stage_id] = (pipeline_id, stage.get("label"))
+            return lookup
+
+        def _transform_stage_history_transitions(
+            self,
+            object_id: str,
+            object_type: str,
+            transitions: List[Dict],
+            stage_lookup: Dict[str, tuple],
+        ) -> List[Dict]:
+            """
+            HubSpot returns propertiesWithHistory entries newest-first. Emit one
+            row per entry, marking the newest as the current stage.
+            """
+            rows = []
+            for index, entry in enumerate(transitions):
+                stage_id = str(entry.get("value", "")) or None
+                pipeline_id, stage_label = stage_lookup.get(stage_id, (None, None))
+                rows.append(
+                    {
+                        "objectId": object_id,
+                        "objectType": object_type,
+                        "pipelineId": pipeline_id,
+                        "stageId": stage_id,
+                        "stageLabel": stage_label,
+                        "enteredAt": self._normalize_pipeline_timestamp(
+                            entry.get("timestamp")
+                        ),
+                        "sourceType": entry.get("sourceType"),
+                        "sourceId": entry.get("sourceId"),
+                        "updatedByUserId": self._stringify_optional(
+                            entry.get("updatedByUserId")
+                        ),
+                        "isCurrentStage": index == 0,
+                    }
+                )
+            return rows
 
         def read_table_deletes(
             self, table_name: str, start_offset: dict, table_options: Dict[str, str]
