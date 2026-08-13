@@ -16,6 +16,7 @@ from typing import (
     Sequence,
 )
 import json
+import re
 import time
 
 from pyspark.sql import Row
@@ -624,6 +625,19 @@ def register_lakeflow_source(spark):
     OWNERS_TABLE_NAME = "owners"
     OWNERS_PAGE_SIZE = 100
 
+    # Engagement attachments: HubSpot engagements (notes/emails/calls/meetings/
+    # tasks) reference their uploaded files via a `hs_attachment_ids` property --
+    # a delimited list of Files API IDs, not an association. There's no batch
+    # endpoint for file metadata, so each unique attachment is hydrated with its
+    # own GET call (cached per read so a file shared by multiple engagements is
+    # only fetched once). One row per (engagementType, engagementId,
+    # attachmentId); each source object type keeps its own incremental cursor so
+    # a slow-moving type (e.g. calls) can't stall on a fast-moving one (e.g.
+    # notes).
+    ATTACHMENTS_TABLE_NAME = "engagement_attachments"
+    ATTACHMENT_SOURCE_OBJECT_TYPES = ("notes", "emails", "calls", "meetings", "tasks")
+    ATTACHMENT_IDS_PROPERTY = "hs_attachment_ids"
+
 
     class HubspotLakeflowConnect(LakeflowConnect):
         def __init__(self, options: dict) -> None:
@@ -834,6 +848,7 @@ def register_lakeflow_source(spark):
                 for object_type in self._stage_history_object_types
             )
             standard_tables.append(OWNERS_TABLE_NAME)
+            standard_tables.append(ATTACHMENTS_TABLE_NAME)
 
             # Add dynamic discovery of custom objects
             try:
@@ -973,6 +988,9 @@ def register_lakeflow_source(spark):
             if table_name == OWNERS_TABLE_NAME:
                 return self._discover_owners_schema()
 
+            if table_name == ATTACHMENTS_TABLE_NAME:
+                return self._discover_engagement_attachments_schema()
+
             # All CRM objects follow the same schema pattern
             return self._discover_crm_object_schema(table_name)
 
@@ -1003,6 +1021,13 @@ def register_lakeflow_source(spark):
                 return {
                     "primary_keys": ["ownerId"],
                     "ingestion_type": "snapshot",
+                }
+
+            if table_name == ATTACHMENTS_TABLE_NAME:
+                return {
+                    "primary_keys": ["engagementType", "engagementId", "attachmentId"],
+                    "cursor_field": "updatedAt",
+                    "ingestion_type": "cdc",
                 }
 
             config = self._get_object_config(table_name)
@@ -1097,6 +1122,26 @@ def register_lakeflow_source(spark):
                     StructField("createdAt", StringType(), True),
                     StructField("updatedAt", StringType(), True),
                     StructField("teams", ArrayType(team_schema), True),
+                ]
+            )
+
+        @staticmethod
+        def _discover_engagement_attachments_schema() -> StructType:
+            return StructType(
+                [
+                    StructField("engagementType", StringType(), True),
+                    StructField("engagementId", StringType(), True),
+                    StructField("attachmentId", StringType(), True),
+                    StructField("fileName", StringType(), True),
+                    StructField("extension", StringType(), True),
+                    StructField("size", LongType(), True),
+                    StructField("type", StringType(), True),
+                    StructField("access", StringType(), True),
+                    StructField("url", StringType(), True),
+                    StructField("signedUrl", StringType(), True),
+                    StructField("createdAt", StringType(), True),
+                    StructField("updatedAt", StringType(), True),
+                    StructField("archived", BooleanType(), True),
                 ]
             )
 
@@ -1225,6 +1270,9 @@ def register_lakeflow_source(spark):
             if table_name == OWNERS_TABLE_NAME:
                 return self._read_owners_table()
 
+            if table_name == ATTACHMENTS_TABLE_NAME:
+                return self._read_engagement_attachments_table(start_offset, table_options)
+
             is_incremental = (
                 start_offset is not None and start_offset.get("updatedAt") is not None
             )
@@ -1297,6 +1345,126 @@ def register_lakeflow_source(spark):
                 "createdAt": self._normalize_pipeline_timestamp(record.get("createdAt")),
                 "updatedAt": self._normalize_pipeline_timestamp(record.get("updatedAt")),
                 "teams": teams,
+            }
+
+        def _read_engagement_attachments_table(
+            self, start_offset: dict, table_options: Dict[str, str]
+        ) -> (Iterator[dict], dict):
+            """
+            Emit one row per (engagementType, engagementId, attachmentId) by
+            scanning each attachment-bearing engagement type for changed records
+            and hydrating their `hs_attachment_ids` via the Files API.
+
+            Each source object type keeps its own sub-offset under `per_type` so
+            types are read incrementally and independently -- reusing a single
+            shared cursor across types would force them all to rewind to the
+            slowest-moving type's checkpoint.
+            """
+            per_type_offsets = (start_offset or {}).get("per_type", {})
+            new_per_type_offsets = dict(per_type_offsets)
+            file_cache: Dict[str, Dict | None] = {}
+            all_rows = []
+
+            for object_type in ATTACHMENT_SOURCE_OBJECT_TYPES:
+                type_offset = per_type_offsets.get(object_type)
+                is_incremental = (
+                    type_offset is not None and type_offset.get("updatedAt") is not None
+                )
+                changed_records, type_new_offset = self._read_data(
+                    object_type,
+                    type_offset,
+                    incremental=is_incremental,
+                    table_options=table_options,
+                )
+                new_per_type_offsets[object_type] = type_new_offset
+
+                for record in changed_records:
+                    engagement_id = record.get("id")
+                    for attachment_id in self._extract_attachment_ids(record):
+                        if attachment_id not in file_cache:
+                            file_cache[attachment_id] = self._fetch_file_with_signed_url(
+                                attachment_id
+                            )
+                        all_rows.append(
+                            self._transform_attachment_record(
+                                object_type,
+                                engagement_id,
+                                attachment_id,
+                                file_cache[attachment_id],
+                            )
+                        )
+
+            return all_rows, {"per_type": new_per_type_offsets}
+
+        @staticmethod
+        def _extract_attachment_ids(record: Dict) -> List[str]:
+            """Parse the `;`- or `,`-delimited hs_attachment_ids property, deduped."""
+            raw = (record.get("properties") or {}).get(ATTACHMENT_IDS_PROPERTY)
+            if not raw:
+                return []
+            ids = [part.strip() for part in re.split(r"[;,]", str(raw)) if part.strip()]
+            return list(dict.fromkeys(ids))
+
+        def _fetch_file_with_signed_url(self, file_id: str) -> Dict | None:
+            """Fetch file metadata, adding a signed URL for private files (whose
+            plain `url` 404s)."""
+            file_meta = self._fetch_file_metadata(file_id)
+            if file_meta is None:
+                return None
+            if "PRIVATE" in (file_meta.get("access") or "").upper():
+                file_meta = dict(file_meta)
+                file_meta["signedUrl"] = self._fetch_signed_url(file_id)
+            return file_meta
+
+        def _fetch_file_metadata(self, file_id: str) -> Dict | None:
+            """Fetch file metadata from the Files API. Returns None if the file
+            is gone (e.g. deleted) rather than failing the whole batch."""
+            url = f"{self.base_url}/files/v3/files/{file_id}"
+            resp = requests.get(url, headers=self.auth_header, timeout=60)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"HubSpot files API error for file {file_id}: "
+                    f"{resp.status_code} {resp.text}"
+                )
+            return resp.json()
+
+        def _fetch_signed_url(self, file_id: str) -> str | None:
+            url = f"{self.base_url}/files/v3/files/{file_id}/signed-url"
+            resp = requests.get(url, headers=self.auth_header, timeout=60)
+            if resp.status_code != 200:
+                return None
+            return resp.json().get("url")
+
+        @staticmethod
+        def _transform_attachment_record(
+            object_type: str,
+            engagement_id,
+            attachment_id: str,
+            file_meta: Dict | None,
+        ) -> Dict:
+            file_meta = file_meta or {}
+            return {
+                "engagementType": object_type,
+                "engagementId": (
+                    str(engagement_id) if engagement_id is not None else None
+                ),
+                "attachmentId": attachment_id,
+                "fileName": file_meta.get("name"),
+                "extension": file_meta.get("extension"),
+                "size": file_meta.get("size"),
+                "type": file_meta.get("type"),
+                "access": file_meta.get("access"),
+                "url": file_meta.get("url"),
+                "signedUrl": file_meta.get("signedUrl"),
+                "createdAt": HubspotLakeflowConnect._normalize_pipeline_timestamp(
+                    file_meta.get("createdAt")
+                ),
+                "updatedAt": HubspotLakeflowConnect._normalize_pipeline_timestamp(
+                    file_meta.get("updatedAt")
+                ),
+                "archived": file_meta.get("archived"),
             }
 
         def _read_stage_history_table(
