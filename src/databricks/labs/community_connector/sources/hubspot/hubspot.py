@@ -1,7 +1,7 @@
-import json
+import re
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List
 
 import requests
 from pyspark.sql.types import (
@@ -15,6 +15,44 @@ from pyspark.sql.types import (
 )
 
 from databricks.labs.community_connector.interface import LakeflowConnect
+
+FULL_REFRESH_PAGE_SIZE = 100
+BATCH_READ_PROPERTY_CHUNK_SIZE = 100
+UPDATED_AT_EXCLUSIVE_OFFSET_KEY = "_updatedAt_exclusive"
+PIPELINE_OBJECT_TYPES = ("deals", "tickets")
+PIPELINES_TABLE_SUFFIX = "_pipelines"
+
+# Stage-propagation history: one row per stage transition for a deal/ticket
+# moving through its pipeline. HubSpot uses a different "current stage"
+# property name per object type.
+STAGE_HISTORY_TABLE_SUFFIX = "_stage_history"
+STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE = {
+    "deals": "dealstage",
+    "tickets": "hs_pipeline_stage",
+}
+# HubSpot's batch/read endpoint caps `propertiesWithHistory` requests at 50
+# inputs per call -- lower than the 100-item cap on plain property batch
+# reads used elsewhere in this connector.
+STAGE_HISTORY_BATCH_SIZE = 50
+
+# Owners: HubSpot's user directory (deal/ticket/company owners). This is a
+# dedicated API (crm/v3/owners), not a CRM object with properties, so it
+# gets a single fixed-name snapshot table rather than one per object type.
+OWNERS_TABLE_NAME = "owners"
+OWNERS_PAGE_SIZE = 100
+
+# Engagement attachments: HubSpot engagements (notes/emails/calls/meetings/
+# tasks) reference their uploaded files via a `hs_attachment_ids` property --
+# a delimited list of Files API IDs, not an association. There's no batch
+# endpoint for file metadata, so each unique attachment is hydrated with its
+# own GET call (cached per read so a file shared by multiple engagements is
+# only fetched once). One row per (engagementType, engagementId,
+# attachmentId); each source object type keeps its own incremental cursor so
+# a slow-moving type (e.g. calls) can't stall on a fast-moving one (e.g.
+# notes).
+ATTACHMENTS_TABLE_NAME = "engagement_attachments"
+ATTACHMENT_SOURCE_OBJECT_TYPES = ("notes", "emails", "calls", "meetings", "tasks")
+ATTACHMENT_IDS_PROPERTY = "hs_attachment_ids"
 
 
 class HubspotLakeflowConnect(LakeflowConnect):
@@ -115,8 +153,91 @@ class HubspotLakeflowConnect(LakeflowConnect):
             "cursor_field": "updatedAt",
             "cursor_property_field": "hs_lastmodifieddate",
             "associations": [],
-            "supports_deletes": False,  # Custom objects don't support archived queries by default
+            "supports_deletes": False,
+            # Custom objects don't support archived queries by default.
         }
+        self._pipeline_object_types = self._discover_pipeline_object_types()
+        self._stage_history_object_types = [
+            object_type
+            for object_type in self._pipeline_object_types
+            if object_type in STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE
+        ]
+
+    def _discover_pipeline_object_types(self) -> List[str]:
+        """Return CRM object types that expose the HubSpot pipelines API."""
+        available_types = list(PIPELINE_OBJECT_TYPES)
+
+        try:
+            for custom_object in self._discover_custom_objects():
+                try:
+                    self._fetch_pipelines(custom_object)
+                    available_types.append(custom_object)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(available_types))
+
+    @staticmethod
+    def _is_pipelines_table(table_name: str) -> bool:
+        return table_name.endswith(PIPELINES_TABLE_SUFFIX)
+
+    @staticmethod
+    def _pipeline_table_name(object_type: str) -> str:
+        return f"{object_type}{PIPELINES_TABLE_SUFFIX}"
+
+    def _get_pipeline_object_type(self, table_name: str) -> str:
+        if not self._is_pipelines_table(table_name):
+            raise ValueError(f"Table is not a pipelines table: {table_name}")
+        return table_name[: -len(PIPELINES_TABLE_SUFFIX)]
+
+    @staticmethod
+    def _is_stage_history_table(table_name: str) -> bool:
+        if not table_name.endswith(STAGE_HISTORY_TABLE_SUFFIX):
+            return False
+        object_type = table_name[: -len(STAGE_HISTORY_TABLE_SUFFIX)]
+        return object_type in STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE
+
+    @staticmethod
+    def _stage_history_table_name(object_type: str) -> str:
+        return f"{object_type}{STAGE_HISTORY_TABLE_SUFFIX}"
+
+    def _get_stage_history_object_type(self, table_name: str) -> str:
+        if not self._is_stage_history_table(table_name):
+            raise ValueError(f"Table is not a stage history table: {table_name}")
+        return table_name[: -len(STAGE_HISTORY_TABLE_SUFFIX)]
+
+    @staticmethod
+    def _get_updated_at_offset_state(
+        start_offset: dict | None,
+    ) -> tuple[str | None, bool]:
+        """Return the checkpoint timestamp and whether it is exclusive."""
+        if not start_offset:
+            return None, False
+        return (
+            start_offset.get("updatedAt"),
+            bool(start_offset.get(UPDATED_AT_EXCLUSIVE_OFFSET_KEY)),
+        )
+
+    @staticmethod
+    def _build_updated_at_offset(
+        updated_at: str | None, exclusive: bool = False
+    ) -> dict:
+        """Build the incremental checkpoint payload for HubSpot reads."""
+        if not updated_at:
+            return {}
+        offset = {"updatedAt": updated_at}
+        if exclusive:
+            offset[UPDATED_AT_EXCLUSIVE_OFFSET_KEY] = True
+        return offset
+
+    @staticmethod
+    def _chunk_list(values: List[str], chunk_size: int) -> Iterator[List[str]]:
+        """Yield stable slices of ``values`` no larger than ``chunk_size``."""
+        for start in range(0, len(values), chunk_size):
+            yield values[start:start + chunk_size]
 
     def list_tables(self) -> list[str]:
         """
@@ -134,6 +255,16 @@ class HubspotLakeflowConnect(LakeflowConnect):
             "tasks",
             "notes",
         ]
+        standard_tables.extend(
+            self._pipeline_table_name(object_type)
+            for object_type in self._pipeline_object_types
+        )
+        standard_tables.extend(
+            self._stage_history_table_name(object_type)
+            for object_type in self._stage_history_object_types
+        )
+        standard_tables.append(OWNERS_TABLE_NAME)
+        standard_tables.append(ATTACHMENTS_TABLE_NAME)
 
         # Add dynamic discovery of custom objects
         try:
@@ -232,13 +363,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
             table_name: The name of the table to fetch the metadata for.
 
         Returns:
-            A dictionary containing the metadata of the table. It includes the following keys:
-                - primary_keys: The name of the primary key columns of the table.
-                - cursor_field: The name of the field to use as a cursor for incremental loading.
-                - ingestion_type: The type of ingestion to use for the table. It should be one of:
-                    - "snapshot": For snapshot loading.
-                    - "cdc": capture incremental changes
-                    - "append": incremental append
+            A dictionary containing table metadata such as primary keys,
+            cursor field, and ingestion type.
         """
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
@@ -269,6 +395,18 @@ class HubspotLakeflowConnect(LakeflowConnect):
         Returns:
             StructType representing the table schema
         """
+        if self._is_pipelines_table(table_name):
+            return self._discover_pipeline_schema()
+
+        if self._is_stage_history_table(table_name):
+            return self._discover_stage_history_schema()
+
+        if table_name == OWNERS_TABLE_NAME:
+            return self._discover_owners_schema()
+
+        if table_name == ATTACHMENTS_TABLE_NAME:
+            return self._discover_engagement_attachments_schema()
+
         # All CRM objects follow the same schema pattern
         return self._discover_crm_object_schema(table_name)
 
@@ -276,6 +414,38 @@ class HubspotLakeflowConnect(LakeflowConnect):
         """
         Get metadata for a table based on object configuration.
         """
+        if self._is_pipelines_table(table_name):
+            object_type = self._get_pipeline_object_type(table_name)
+            return {
+                "primary_keys": ["pipelineId"],
+                "object_type": object_type,
+                "ingestion_type": "snapshot",
+            }
+
+        if self._is_stage_history_table(table_name):
+            object_type = self._get_stage_history_object_type(table_name)
+            base_config = self._get_object_config(object_type)
+            return {
+                "primary_keys": ["objectId", "stageId", "enteredAt"],
+                "cursor_field": "enteredAt",
+                "cursor_property_field": base_config["cursor_property_field"],
+                "object_type": object_type,
+                "ingestion_type": "cdc",
+            }
+
+        if table_name == OWNERS_TABLE_NAME:
+            return {
+                "primary_keys": ["ownerId"],
+                "ingestion_type": "snapshot",
+            }
+
+        if table_name == ATTACHMENTS_TABLE_NAME:
+            return {
+                "primary_keys": ["engagementType", "engagementId", "attachmentId"],
+                "cursor_field": "updatedAt",
+                "ingestion_type": "cdc",
+            }
+
         config = self._get_object_config(table_name)
 
         # Get property names and cursor property field for API calls
@@ -294,6 +464,102 @@ class HubspotLakeflowConnect(LakeflowConnect):
             "associations": config.get("associations", []),
             "ingestion_type": ingestion_type,
         }
+
+    @staticmethod
+    def _discover_pipeline_schema() -> StructType:
+        stage_metadata_schema = StructType(
+            [
+                StructField("isClosed", StringType(), True),
+                StructField("probability", StringType(), True),
+                StructField("ticketState", StringType(), True),
+            ]
+        )
+        stage_schema = StructType(
+            [
+                StructField("stageId", StringType(), True),
+                StructField("label", StringType(), True),
+                StructField("displayOrder", LongType(), True),
+                StructField("active", BooleanType(), True),
+                StructField("createdAt", StringType(), True),
+                StructField("updatedAt", StringType(), True),
+                StructField("metadata", stage_metadata_schema, True),
+            ]
+        )
+        return StructType(
+            [
+                StructField("pipelineId", StringType(), True),
+                StructField("objectType", StringType(), True),
+                StructField("objectTypeId", StringType(), True),
+                StructField("label", StringType(), True),
+                StructField("displayOrder", LongType(), True),
+                StructField("active", BooleanType(), True),
+                StructField("default", BooleanType(), True),
+                StructField("createdAt", StringType(), True),
+                StructField("updatedAt", StringType(), True),
+                StructField("stages", ArrayType(stage_schema), True),
+            ]
+        )
+
+    @staticmethod
+    def _discover_stage_history_schema() -> StructType:
+        return StructType(
+            [
+                StructField("objectId", StringType(), True),
+                StructField("objectType", StringType(), True),
+                StructField("pipelineId", StringType(), True),
+                StructField("stageId", StringType(), True),
+                StructField("stageLabel", StringType(), True),
+                StructField("enteredAt", StringType(), True),
+                StructField("sourceType", StringType(), True),
+                StructField("sourceId", StringType(), True),
+                StructField("updatedByUserId", StringType(), True),
+                StructField("isCurrentStage", BooleanType(), True),
+            ]
+        )
+
+    @staticmethod
+    def _discover_owners_schema() -> StructType:
+        team_schema = StructType(
+            [
+                StructField("id", StringType(), True),
+                StructField("name", StringType(), True),
+                StructField("primary", BooleanType(), True),
+            ]
+        )
+        return StructType(
+            [
+                StructField("ownerId", StringType(), True),
+                StructField("email", StringType(), True),
+                StructField("firstName", StringType(), True),
+                StructField("lastName", StringType(), True),
+                StructField("userId", StringType(), True),
+                StructField("userIdIncludingInactive", StringType(), True),
+                StructField("archived", BooleanType(), True),
+                StructField("createdAt", StringType(), True),
+                StructField("updatedAt", StringType(), True),
+                StructField("teams", ArrayType(team_schema), True),
+            ]
+        )
+
+    @staticmethod
+    def _discover_engagement_attachments_schema() -> StructType:
+        return StructType(
+            [
+                StructField("engagementType", StringType(), True),
+                StructField("engagementId", StringType(), True),
+                StructField("attachmentId", StringType(), True),
+                StructField("fileName", StringType(), True),
+                StructField("extension", StringType(), True),
+                StructField("size", LongType(), True),
+                StructField("type", StringType(), True),
+                StructField("access", StringType(), True),
+                StructField("url", StringType(), True),
+                StructField("signedUrl", StringType(), True),
+                StructField("createdAt", StringType(), True),
+                StructField("updatedAt", StringType(), True),
+                StructField("archived", BooleanType(), True),
+            ]
+        )
 
     def _discover_crm_object_schema(self, table_name: str) -> StructType:
         """
@@ -324,12 +590,13 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 prop_name = prop.get("name", "")
                 prop_type = prop.get("type", "string")
 
-                # Map HubSpot property types to Spark types
                 spark_type = self._map_hubspot_type_to_spark(prop_type)
                 properties_fields.append(StructField(prop_name, spark_type, True))
 
         # Create nested properties StructType
-        properties_struct = StructType(properties_fields) if properties_fields else StructType([])
+        properties_struct = (
+            StructType(properties_fields) if properties_fields else StructType([])
+        )
 
         # Add properties as a nested field
         base_fields.append(StructField("properties", properties_struct, True))
@@ -374,10 +641,10 @@ class HubspotLakeflowConnect(LakeflowConnect):
         type_mapping = {
             "string": StringType(),
             "enumeration": StringType(),
-            "bool": BooleanType(),  # Keep boolean as boolean for better data handling
+            "bool": BooleanType(),
             "number": LongType(),
-            "date": StringType(),  # Store as string to preserve ISO format
-            "date-time": StringType(),  # Store as string to preserve ISO format
+            "date": StringType(),
+            "date-time": StringType(),
             "datetime": StringType(),
             "json": StringType(),
             "phone_number": StringType(),
@@ -408,6 +675,20 @@ class HubspotLakeflowConnect(LakeflowConnect):
             )
 
         # Determine if this is an incremental read
+        if self._is_pipelines_table(table_name):
+            return self._read_pipeline_table(table_name)
+
+        if self._is_stage_history_table(table_name):
+            return self._read_stage_history_table(
+                table_name, start_offset, table_options
+            )
+
+        if table_name == OWNERS_TABLE_NAME:
+            return self._read_owners_table()
+
+        if table_name == ATTACHMENTS_TABLE_NAME:
+            return self._read_engagement_attachments_table(start_offset, table_options)
+
         is_incremental = (
             start_offset is not None and start_offset.get("updatedAt") is not None
         )
@@ -418,6 +699,331 @@ class HubspotLakeflowConnect(LakeflowConnect):
             incremental=is_incremental,
             table_options=table_options,
         )
+
+    def _read_pipeline_table(self, table_name: str) -> (Iterator[dict], dict):
+        """Read snapshot pipeline metadata for a HubSpot object type."""
+        object_type = self._get_pipeline_object_type(table_name)
+        records = self._fetch_pipelines(object_type)
+        return [self._transform_pipeline_record(record) for record in records], {}
+
+    def _read_owners_table(self) -> (Iterator[dict], dict):
+        """Read snapshot owner (user directory) metadata."""
+        records = self._fetch_owners()
+        return [self._transform_owner_record(record) for record in records], {}
+
+    def _fetch_owners(self) -> List[Dict]:
+        """Fetch all HubSpot owners, paginating through the owners API."""
+        url = f"{self.base_url}/crm/v3/owners/"
+        all_owners = []
+        after = None
+
+        while True:
+            params = {"limit": str(OWNERS_PAGE_SIZE)}
+            if after:
+                params["after"] = after
+
+            resp = requests.get(url, headers=self.auth_header, params=params, timeout=60)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"HubSpot owners API error: {resp.status_code} {resp.text}"
+                )
+
+            data = resp.json()
+            all_owners.extend(data.get("results", []))
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+            time.sleep(0.1)
+
+        return all_owners
+
+    def _transform_owner_record(self, record: Dict) -> Dict:
+        """Normalize a HubSpot owner into a stable snapshot row."""
+        teams = []
+        for team in record.get("teams", []) or []:
+            teams.append(
+                {
+                    "id": self._stringify_optional(team.get("id")),
+                    "name": team.get("name"),
+                    "primary": team.get("primary"),
+                }
+            )
+        return {
+            "ownerId": str(record.get("id", "")) or None,
+            "email": record.get("email"),
+            "firstName": record.get("firstName"),
+            "lastName": record.get("lastName"),
+            "userId": self._stringify_optional(record.get("userId")),
+            "userIdIncludingInactive": self._stringify_optional(
+                record.get("userIdIncludingInactive")
+            ),
+            "archived": record.get("archived"),
+            "createdAt": self._normalize_pipeline_timestamp(record.get("createdAt")),
+            "updatedAt": self._normalize_pipeline_timestamp(record.get("updatedAt")),
+            "teams": teams,
+        }
+
+    def _read_engagement_attachments_table(
+        self, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Emit one row per (engagementType, engagementId, attachmentId) by
+        scanning each attachment-bearing engagement type for changed records
+        and hydrating their `hs_attachment_ids` via the Files API.
+
+        Each source object type keeps its own sub-offset under `per_type` so
+        types are read incrementally and independently -- reusing a single
+        shared cursor across types would force them all to rewind to the
+        slowest-moving type's checkpoint.
+        """
+        per_type_offsets = (start_offset or {}).get("per_type", {})
+        new_per_type_offsets = dict(per_type_offsets)
+        file_cache: Dict[str, Dict | None] = {}
+        all_rows = []
+
+        for object_type in ATTACHMENT_SOURCE_OBJECT_TYPES:
+            type_offset = per_type_offsets.get(object_type)
+            is_incremental = (
+                type_offset is not None and type_offset.get("updatedAt") is not None
+            )
+            changed_records, type_new_offset = self._read_data(
+                object_type,
+                type_offset,
+                incremental=is_incremental,
+                table_options=table_options,
+            )
+            new_per_type_offsets[object_type] = type_new_offset
+
+            for record in changed_records:
+                engagement_id = record.get("id")
+                for attachment_id in self._extract_attachment_ids(record):
+                    if attachment_id not in file_cache:
+                        file_cache[attachment_id] = self._fetch_file_with_signed_url(
+                            attachment_id
+                        )
+                    all_rows.append(
+                        self._transform_attachment_record(
+                            object_type,
+                            engagement_id,
+                            attachment_id,
+                            file_cache[attachment_id],
+                        )
+                    )
+
+        return all_rows, {"per_type": new_per_type_offsets}
+
+    @staticmethod
+    def _extract_attachment_ids(record: Dict) -> List[str]:
+        """Parse the `;`- or `,`-delimited hs_attachment_ids property, deduped."""
+        raw = (record.get("properties") or {}).get(ATTACHMENT_IDS_PROPERTY)
+        if not raw:
+            return []
+        ids = [part.strip() for part in re.split(r"[;,]", str(raw)) if part.strip()]
+        return list(dict.fromkeys(ids))
+
+    def _fetch_file_with_signed_url(self, file_id: str) -> Dict | None:
+        """Fetch file metadata, adding a signed URL for private files (whose
+        plain `url` 404s)."""
+        file_meta = self._fetch_file_metadata(file_id)
+        if file_meta is None:
+            return None
+        if "PRIVATE" in (file_meta.get("access") or "").upper():
+            file_meta = dict(file_meta)
+            file_meta["signedUrl"] = self._fetch_signed_url(file_id)
+        return file_meta
+
+    def _fetch_file_metadata(self, file_id: str) -> Dict | None:
+        """Fetch file metadata from the Files API. Returns None if the file
+        is gone (e.g. deleted) rather than failing the whole batch."""
+        url = f"{self.base_url}/files/v3/files/{file_id}"
+        resp = requests.get(url, headers=self.auth_header, timeout=60)
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"HubSpot files API error for file {file_id}: "
+                f"{resp.status_code} {resp.text}"
+            )
+        return resp.json()
+
+    def _fetch_signed_url(self, file_id: str) -> str | None:
+        url = f"{self.base_url}/files/v3/files/{file_id}/signed-url"
+        resp = requests.get(url, headers=self.auth_header, timeout=60)
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("url")
+
+    @staticmethod
+    def _transform_attachment_record(
+        object_type: str,
+        engagement_id,
+        attachment_id: str,
+        file_meta: Dict | None,
+    ) -> Dict:
+        file_meta = file_meta or {}
+        return {
+            "engagementType": object_type,
+            "engagementId": (
+                str(engagement_id) if engagement_id is not None else None
+            ),
+            "attachmentId": attachment_id,
+            "fileName": file_meta.get("name"),
+            "extension": file_meta.get("extension"),
+            "size": file_meta.get("size"),
+            "type": file_meta.get("type"),
+            "access": file_meta.get("access"),
+            "url": file_meta.get("url"),
+            "signedUrl": file_meta.get("signedUrl"),
+            "createdAt": HubspotLakeflowConnect._normalize_pipeline_timestamp(
+                file_meta.get("createdAt")
+            ),
+            "updatedAt": HubspotLakeflowConnect._normalize_pipeline_timestamp(
+                file_meta.get("updatedAt")
+            ),
+            "archived": file_meta.get("archived"),
+        }
+
+    def _read_stage_history_table(
+        self, table_name: str, start_offset: dict, table_options: Dict[str, str]
+    ) -> (Iterator[dict], dict):
+        """
+        Emit one row per stage transition for deals/tickets moving through a
+        pipeline.
+
+        Reuses the underlying object's own incremental cursor (updatedAt /
+        hs_lastmodifieddate) to find which deals/tickets changed since the
+        last checkpoint -- a stage change always bumps that cursor -- then
+        hydrates each changed record's full stage history via the batch/read
+        `propertiesWithHistory` API.
+
+        Because a record's *entire* stage history is re-fetched whenever any
+        of its properties change (not just the stage), the same transition
+        can be re-emitted on a later run. That's fine: the primary key
+        (objectId, stageId, enteredAt) makes re-emission idempotent under
+        cdc upsert semantics.
+        """
+        object_type = self._get_stage_history_object_type(table_name)
+        stage_property = STAGE_HISTORY_PROPERTY_BY_OBJECT_TYPE[object_type]
+
+        is_incremental = (
+            start_offset is not None and start_offset.get("updatedAt") is not None
+        )
+
+        # Reuse the object's own read path: gives us exactly the set of
+        # deals/tickets that changed since the last checkpoint, plus a
+        # correctly capped offset we can hand straight back to the framework.
+        changed_records, offset = self._read_data(
+            object_type,
+            start_offset,
+            incremental=is_incremental,
+            table_options=table_options,
+        )
+
+        if not changed_records:
+            return [], offset
+
+        stage_lookup = self._build_stage_lookup(object_type)
+
+        history_rows = []
+        record_ids = [
+            str(record["id"]) for record in changed_records if record.get("id")
+        ]
+        for id_chunk in self._chunk_list(record_ids, STAGE_HISTORY_BATCH_SIZE):
+            history_by_id = self._fetch_stage_history_batch(
+                object_type, id_chunk, stage_property
+            )
+            for object_id, transitions in history_by_id.items():
+                history_rows.extend(
+                    self._transform_stage_history_transitions(
+                        object_id, object_type, transitions, stage_lookup
+                    )
+                )
+
+        return history_rows, offset
+
+    def _fetch_stage_history_batch(
+        self, object_type: str, record_ids: List[str], stage_property: str
+    ) -> Dict[str, List[Dict]]:
+        """
+        Batch-read the full historical values of `stage_property` for a set
+        of records.
+
+        Returns {objectId: [ {value, timestamp, sourceType, sourceId,
+        updatedByUserId}, ... ]} -- HubSpot returns these newest-first.
+        """
+        if not record_ids:
+            return {}
+
+        url = f"{self.base_url}/crm/v3/objects/{object_type}/batch/read"
+        payload = {
+            "inputs": [{"id": record_id} for record_id in record_ids],
+            "propertiesWithHistory": [stage_property],
+        }
+        resp = requests.post(url, headers=self.auth_header, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise Exception(
+                "HubSpot stage-history batch read error for "
+                f"{object_type}: {resp.status_code} {resp.text}"
+            )
+
+        history_by_id = {}
+        for record in resp.json().get("results", []):
+            object_id = str(record.get("id", ""))
+            if not object_id:
+                continue
+            property_history = record.get("propertiesWithHistory", {}) or {}
+            history_by_id[object_id] = property_history.get(stage_property, []) or []
+        return history_by_id
+
+    def _build_stage_lookup(self, object_type: str) -> Dict[str, tuple]:
+        """Map stageId -> (pipelineId, stageLabel) for a given object type."""
+        lookup = {}
+        try:
+            pipelines = self._fetch_pipelines(object_type)
+        except Exception:
+            return lookup
+        for pipeline in pipelines:
+            pipeline_id = str(pipeline.get("pipelineId", ""))
+            for stage in pipeline.get("stages", []) or []:
+                stage_id = str(stage.get("stageId", ""))
+                if stage_id:
+                    lookup[stage_id] = (pipeline_id, stage.get("label"))
+        return lookup
+
+    def _transform_stage_history_transitions(
+        self,
+        object_id: str,
+        object_type: str,
+        transitions: List[Dict],
+        stage_lookup: Dict[str, tuple],
+    ) -> List[Dict]:
+        """
+        HubSpot returns propertiesWithHistory entries newest-first. Emit one
+        row per entry, marking the newest as the current stage.
+        """
+        rows = []
+        for index, entry in enumerate(transitions):
+            stage_id = str(entry.get("value", "")) or None
+            pipeline_id, stage_label = stage_lookup.get(stage_id, (None, None))
+            rows.append(
+                {
+                    "objectId": object_id,
+                    "objectType": object_type,
+                    "pipelineId": pipeline_id,
+                    "stageId": stage_id,
+                    "stageLabel": stage_label,
+                    "enteredAt": self._normalize_pipeline_timestamp(
+                        entry.get("timestamp")
+                    ),
+                    "sourceType": entry.get("sourceType"),
+                    "sourceId": entry.get("sourceId"),
+                    "updatedByUserId": self._stringify_optional(
+                        entry.get("updatedByUserId")
+                    ),
+                    "isCurrentStage": index == 0,
+                }
+            )
+        return rows
 
     def read_table_deletes(
         self, table_name: str, start_offset: dict, table_options: Dict[str, str]
@@ -540,8 +1146,12 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         all_records = []
         after = None
-        checkpoint = start_offset.get("updatedAt") if start_offset else None
+        checkpoint, checkpoint_is_exclusive = self._get_updated_at_offset_state(
+            start_offset
+        )
         latest_updated = checkpoint
+        stop_after_current_page = False
+        drain_boundary_updated_at = None
 
         while True:
             if incremental:
@@ -550,7 +1160,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     table_name,
                     property_names,
                     cursor_property_field,
-                    start_offset,
+                    checkpoint,
+                    checkpoint_is_exclusive,
                     after,
                 )
                 if updated_time and (
@@ -566,22 +1177,58 @@ class HubspotLakeflowConnect(LakeflowConnect):
             if not records:
                 break
 
-            # Transform records
-            transformed_records = self._transform_records(records, table_name)
+            if incremental:
+                transformed_records = []
+                for raw_record in records:
+                    if (
+                        max_records is not None
+                        and drain_boundary_updated_at is None
+                        and len(all_records) + len(transformed_records) >= max_records
+                    ):
+                        drain_boundary_updated_at = latest_updated
+
+                    updated_at = raw_record.get("updatedAt")
+                    if (
+                        drain_boundary_updated_at is not None
+                        and updated_at
+                        and updated_at > drain_boundary_updated_at
+                    ):
+                        stop_after_current_page = True
+                        break
+
+                    transformed = self._transform_single_record(raw_record, table_name)
+                    transformed_records.append(transformed)
+                    if updated_at and (
+                        not latest_updated or updated_at > latest_updated
+                    ):
+                        latest_updated = updated_at
+            else:
+                # Transform records
+                transformed_records = self._transform_records(records, table_name)
+
+                # Update latest timestamp
+                for record in transformed_records:
+                    updated_at = record.get("updatedAt")
+                    if updated_at and (
+                        not latest_updated or updated_at > latest_updated
+                    ):
+                        latest_updated = updated_at
+
             all_records.extend(transformed_records)
 
-            # Update latest timestamp
-            for record in transformed_records:
-                updated_at = record.get("updatedAt")
-                if updated_at and (not latest_updated or updated_at > latest_updated):
-                    latest_updated = updated_at
+            if stop_after_current_page:
+                break
 
             if not after:
                 break
 
             # Stop if we've hit the per-microbatch record cap. The next
             # microbatch resumes from latest_updated via the cursor filter.
-            if max_records is not None and len(all_records) >= max_records:
+            if (
+                max_records is not None
+                and len(all_records) >= max_records
+                and drain_boundary_updated_at is None
+            ):
                 break
 
             # Rate limiting
@@ -592,7 +1239,11 @@ class HubspotLakeflowConnect(LakeflowConnect):
         if incremental and latest_updated and latest_updated > self._init_ts:
             latest_updated = self._init_ts
 
-        offset = {"updatedAt": latest_updated} if latest_updated else {}
+        offset = (
+            self._build_updated_at_offset(latest_updated, exclusive=incremental)
+            if latest_updated
+            else {}
+        )
         return all_records, offset
 
     def _fetch_full_refresh_batch(
@@ -603,18 +1254,39 @@ class HubspotLakeflowConnect(LakeflowConnect):
         after: str = None,
         archived: bool = False,
     ):
-        """Fetch a batch of records using full refresh API"""
-        archived_param = "true" if archived else "false"
-        url = f"{self.base_url}/crm/v3/objects/{table_name}?limit=100&archived={archived_param}"
+        """Fetch a full-refresh page without large property query strings."""
+        records, next_after = self._list_full_refresh_page(
+            table_name, associations, after=after, archived=archived
+        )
+        if not records or archived or not property_names:
+            return records, next_after
 
+        hydrated_records = self._hydrate_record_properties(
+            table_name, records, property_names
+        )
+        return hydrated_records, next_after
+
+    def _list_full_refresh_page(
+        self,
+        table_name: str,
+        associations: List[str],
+        after: str = None,
+        archived: bool = False,
+    ):
+        """List one page of objects with compact query parameters."""
+        url = f"{self.base_url}/crm/v3/objects/{table_name}"
+        params = {
+            "limit": str(FULL_REFRESH_PAGE_SIZE),
+            "archived": "true" if archived else "false",
+        }
         if after:
-            url += f"&after={after}"
-        if property_names:
-            url += f"&properties={','.join(property_names)}"
+            params["after"] = after
         if associations:
-            url += f"&associations={','.join(associations)}"
+            params["associations"] = ",".join(associations)
 
-        resp = requests.get(url, headers=self.auth_header, timeout=60)
+        resp = requests.get(
+            url, headers=self.auth_header, params=params, timeout=60
+        )
         if resp.status_code != 200:
             raise Exception(
                 f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
@@ -626,16 +1298,87 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         return records, next_after
 
+    def _fetch_pipelines(self, object_type: str) -> List[Dict]:
+        """Fetch pipeline metadata for a supported HubSpot object type."""
+        url = f"{self.base_url}/crm-pipelines/v1/pipelines/{object_type}"
+        params = {"includeInactive": "EXCLUDE_DELETED"}
+        resp = requests.get(
+            url, headers=self.auth_header, params=params, timeout=60
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"HubSpot pipelines API error for {object_type}: "
+                f"{resp.status_code} {resp.text}"
+            )
+        return resp.json().get("results", [])
+
+    def _hydrate_record_properties(
+        self, table_name: str, records: List[Dict], property_names: List[str]
+    ) -> List[Dict]:
+        """Attach full property payloads via batch-read POST calls."""
+        if not records or not property_names:
+            return records
+
+        record_ids = [str(record["id"]) for record in records if record.get("id")]
+        if not record_ids:
+            return records
+
+        properties_by_id = {record_id: {} for record_id in record_ids}
+        for property_chunk in self._chunk_list(
+            property_names, BATCH_READ_PROPERTY_CHUNK_SIZE
+        ):
+            batch_results = self._batch_read_properties(
+                table_name, record_ids, property_chunk
+            )
+            for batch_record in batch_results:
+                record_id = str(batch_record.get("id", ""))
+                if not record_id:
+                    continue
+                properties_by_id.setdefault(record_id, {}).update(
+                    batch_record.get("properties", {}) or {}
+                )
+
+        hydrated_records = []
+        for record in records:
+            record_id = str(record.get("id", ""))
+            merged = dict(record)
+            merged["properties"] = properties_by_id.get(record_id, {})
+            hydrated_records.append(merged)
+        return hydrated_records
+
+    def _batch_read_properties(
+        self, table_name: str, record_ids: List[str], property_names: List[str]
+    ) -> List[Dict]:
+        """Read object properties via POST body so large schemas avoid URI limits."""
+        if not record_ids or not property_names:
+            return []
+
+        url = f"{self.base_url}/crm/v3/objects/{table_name}/batch/read"
+        payload = {
+            "inputs": [{"id": record_id} for record_id in record_ids],
+            "properties": property_names,
+        }
+        resp = requests.post(
+            url, headers=self.auth_header, json=payload, timeout=60
+        )
+        if resp.status_code != 200:
+            raise Exception(
+                "HubSpot batch read API error for "
+                f"{table_name}: {resp.status_code} {resp.text}"
+            )
+        return resp.json().get("results", [])
+
     def _fetch_incremental_batch(
         self,
         table_name: str,
         property_names: List[str],
         cursor_property_field: str,
-        start_offset: dict,
+        checkpoint: str | None,
+        checkpoint_is_exclusive: bool,
         after: str = None,
     ):
         """Fetch a batch of records using incremental search API"""
-        last_updated = start_offset.get("updatedAt", "1970-01-01T00:00:00.000Z")
+        last_updated = checkpoint or "1970-01-01T00:00:00.000Z"
 
         # Convert to milliseconds for HubSpot
         try:
@@ -643,7 +1386,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp()
                 * 1000
             )
-        except:
+        except Exception:
             last_updated_ms = 0
 
         search_body = {
@@ -652,7 +1395,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     "filters": [
                         {
                             "propertyName": cursor_property_field,
-                            "operator": "GTE",
+                            "operator": (
+                                "GT" if checkpoint_is_exclusive else "GTE"
+                            ),
                             "value": str(last_updated_ms),
                         }
                     ]
@@ -711,6 +1456,74 @@ class HubspotLakeflowConnect(LakeflowConnect):
         transformed_record.update(self._extract_associations(record, table_name))
 
         return transformed_record
+
+    def _transform_pipeline_record(self, record: Dict) -> Dict:
+        """Normalize HubSpot pipeline metadata into a stable snapshot row."""
+        transformed = {
+            "pipelineId": str(record.get("pipelineId", "")) or None,
+            "objectType": record.get("objectType"),
+            "objectTypeId": record.get("objectTypeId"),
+            "label": record.get("label"),
+            "displayOrder": record.get("displayOrder"),
+            "active": record.get("active"),
+            "default": record.get("default"),
+            "createdAt": self._normalize_pipeline_timestamp(record.get("createdAt")),
+            "updatedAt": self._normalize_pipeline_timestamp(record.get("updatedAt")),
+            "stages": [],
+        }
+        for stage in record.get("stages", []) or []:
+            transformed["stages"].append(
+                {
+                    "stageId": str(stage.get("stageId", "")) or None,
+                    "label": stage.get("label"),
+                    "displayOrder": stage.get("displayOrder"),
+                    "active": stage.get("active"),
+                    "createdAt": self._normalize_pipeline_timestamp(
+                        stage.get("createdAt")
+                    ),
+                    "updatedAt": self._normalize_pipeline_timestamp(
+                        stage.get("updatedAt")
+                    ),
+                    "metadata": {
+                        "isClosed": self._stringify_optional(
+                            (stage.get("metadata") or {}).get("isClosed")
+                        ),
+                        "probability": self._stringify_optional(
+                            (stage.get("metadata") or {}).get("probability")
+                        ),
+                        "ticketState": self._stringify_optional(
+                            (stage.get("metadata") or {}).get("ticketState")
+                        ),
+                    },
+                }
+            )
+        return transformed
+
+    @staticmethod
+    def _normalize_pipeline_timestamp(value) -> str | None:
+        """Convert HubSpot millisecond or ISO timestamps into ISO-8601 UTC."""
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return (
+                datetime.fromtimestamp(value / 1000, timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+                + "Z"
+            )
+        value_str = str(value)
+        if value_str.isdigit():
+            return (
+                datetime.fromtimestamp(int(value_str) / 1000, timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+                + "Z"
+            )
+        return value_str
+
+    @staticmethod
+    def _stringify_optional(value) -> str | None:
+        if value in (None, ""):
+            return None
+        return str(value)
 
     def _sanitize_properties(self, properties: Dict) -> Dict:
         """Convert empty strings to None in properties dict.
