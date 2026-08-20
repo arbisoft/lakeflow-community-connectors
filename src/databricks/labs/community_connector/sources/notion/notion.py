@@ -235,11 +235,14 @@ class NotionLakeflowConnect(LakeflowConnect):
 
         return resp
 
-    def _get_json(self, path: str, params: Optional[dict] = None) -> Optional[dict]:
+    def _get_json(
+        self, path: str, params: Optional[dict] = None, *, ignore_statuses: Tuple[int, ...] = ()
+    ) -> Optional[dict]:
         """GET one object. Returns ``None`` for 403/404 (not shared with the
-        integration) rather than aborting the whole read."""
+        integration) or any status in ``ignore_statuses`` rather than aborting
+        the whole read."""
         resp = self._request("GET", path, params=params or {})
-        if resp.status_code in (403, 404):
+        if resp.status_code in (403, 404) or resp.status_code in ignore_statuses:
             return None
         if resp.status_code != 200:
             raise RuntimeError(
@@ -426,9 +429,15 @@ class NotionLakeflowConnect(LakeflowConnect):
                 seen.add(view_id)
 
                 view = ref
-                # A partial ref has no name/created_time — hydrate it.
+                # A partial ref has no name/created_time — hydrate it. Some
+                # view types (e.g. "feed") 400 on the single-view GET even
+                # though they list fine — Notion just doesn't support
+                # retrieving them individually. The id came straight from the
+                # list endpoint, so a 400 here means an unsupported view
+                # type, not a malformed request; fall back to the partial ref
+                # rather than failing the whole read over one view.
                 if "name" not in ref or "created_time" not in ref:
-                    hydrated = self._get_json(f"views/{view_id}")
+                    hydrated = self._get_json(f"views/{view_id}", ignore_statuses=(400,))
                     if hydrated:
                         view = hydrated
                 records.append(self._flatten_view(view, data_source_id))
