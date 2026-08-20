@@ -1,0 +1,344 @@
+{
+  "aaaaaaaa-0001-4000-8000-000000000001:rel%3Aabc": [
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0000-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0001-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0002-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0003-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0004-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0005-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0006-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0007-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0008-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0009-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0010-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0011-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0012-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0013-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0014-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0015-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0016-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0017-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0018-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0019-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0020-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0021-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0022-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0023-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0024-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0025-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0026-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0027-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0028-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0029-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0030-4000-8000-000000000000"
+      }
+    },
+    {
+      "object": "property_item",
+      "type": "relation",
+      "id": "rel%3Aabc",
+      "relation": {
+        "id": "eeeeeeee-0031-4000-8000-000000000000"
+      }
+    }
+  ],
+  "aaaaaaaa-0001-4000-8000-000000000001:rol%3Adef": [
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 0
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 2
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 4
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 6
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 8
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 10
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 12
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 14
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 16
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 18
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 20
+    },
+    {
+      "object": "property_item",
+      "type": "number",
+      "id": "rol%3Adef",
+      "number": 22
+    },
+    {
+      "object": "property_item",
+      "type": "rollup",
+      "id": "rol%3Adef",
+      "rollup": {
+        "type": "number",
+        "number": 132,
+        "function": "sum"
+      }
+    }
+  ]
+}

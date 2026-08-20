@@ -1,354 +1,454 @@
 # Notion API Documentation
 
+Source reference for the Notion Lakeflow community connector.
+
+**API version: `2026-03-11`** (sent as the `Notion-Version` header; override with
+the `notion_version` connector option).
+
+That version is required for three things this connector depends on:
+
+- the **Views API** (`/v1/views`)
+- **`GET /v1/file_uploads`** (the list endpoint)
+- the **`meeting_notes`** block type (renamed from `transcription`)
+
+It also renames `archived` to `in_trash` on pages, blocks, databases and data
+sources. The connector reads both names, so pinning `notion_version` back to
+`2025-09-03` still works.
+
+---
+
 ## Authorization
 
 ### Supported Methods
 
-Notion supports two authentication methods:
-
-1. **API Token (Internal Integration)** - Preferred for connector usage
-2. **OAuth 2.0** - For user-facing applications
+| Method | Used by connector | Notes |
+|---|---|---|
+| Internal integration token | Yes | Simplest; token is scoped to one workspace |
+| OAuth 2.0 (public integration) | Compatible | The connector only needs the resulting bearer token |
 
 ### API Token Authentication
 
-For internal integrations, use a Bot API token:
+```
+Authorization: Bearer secret_xxxxxxxxxxxxxxxxxxxx
+Notion-Version: 2026-03-11
+Content-Type: application/json
+```
 
-- **Header**: `Authorization: Bearer {token}`
-- **Header**: `Notion-Version: 2025-09-03` (API version)
-- **Header**: `Content-Type: application/json`
-
-### OAuth 2.0 Authentication
-
-For OAuth flows, the connector stores:
-- `client_id`
-- `client_secret`
-- `access_token` (exchanged at runtime)
-
-The connector does NOT run user-facing OAuth flows; it uses pre-obtained tokens.
+Tokens come from <https://www.notion.so/my-integrations>. **An integration sees
+only what has been explicitly shared with it** — an unshared page is not
+"forbidden", it is simply absent from search results. This is the single most
+common cause of an unexpectedly empty table.
 
 ### Example API Request
 
 ```bash
-# Using API Token
-curl -X GET https://api.notion.com/v1/users \
-  -H "Authorization: Bearer secret_xxx" \
-  -H "Notion-Version: 2025-09-03" \
-  -H "Content-Type: application/json"
+curl -X POST https://api.notion.com/v1/search \
+  -H "Authorization: Bearer $NOTION_TOKEN" \
+  -H "Notion-Version: 2026-03-11" \
+  -H "Content-Type: application/json" \
+  -d '{"filter":{"property":"object","value":"page"},
+       "sort":{"direction":"ascending","timestamp":"last_edited_time"}}'
 ```
+
+---
+
+## The shape of the API: a graph, not a set of collections
+
+This is the fact that drives the entire connector design. Notion lets you
+**enumerate** exactly three things:
+
+| Endpoint | Returns |
+|---|---|
+| `POST /v1/search` | pages and data sources shared with the integration |
+| `GET /v1/users` | workspace members and bots |
+| `GET /v1/file_uploads` | files uploaded via the integration |
+
+Everything else is reachable **only by walking outward from one of those
+roots**:
+
+```
+POST /v1/search (data_source)
+        │
+        ├─ .parent.database_id ──► GET /v1/databases/{id}        → databases
+        ├─ .id ─────────────────► GET /v1/views?data_source_id=  → views
+        │                              └─► GET /v1/views/{id}      (hydrate)
+        │
+POST /v1/search (page)
+        │
+        ├─ .id ─► GET /v1/blocks/{page_id}/children ──┐          → blocks
+        │              └─ recurse while has_children ─┘
+        ├─ .id ─► GET /v1/comments?block_id={page_id}            → comments
+        └─ .properties[*] ─► GET /v1/pages/{id}/properties/{pid}   (repair)
+```
+
+### Databases are *not* searchable
+
+`POST /v1/search`'s `filter.value` accepts **only `"page"` and
+`"data_source"`**. There is no `"database"` value, and `GET /v1/databases`
+(the old list endpoint) was deprecated in `2025-09-03`.
+
+So the only supported route to a database container is through the data
+sources it owns: `data_source.parent.database_id` → `GET /v1/databases/{id}`.
+The connector dedupes ids, since several data sources can share one container.
+
+---
 
 ## Object List
 
-The Notion API provides access to the following objects:
+| Table | Source endpoints |
+|---|---|
+| `pages` | `POST /v1/search` + `GET /v1/pages/{id}/properties/{pid}` |
+| `databases` | `POST /v1/search` → `GET /v1/databases/{id}` |
+| `data_sources` | `POST /v1/search` |
+| `views` | `POST /v1/search` → `GET /v1/views` → `GET /v1/views/{id}` |
+| `blocks` | `POST /v1/search` → `GET /v1/blocks/{id}/children` (recursive) |
+| `comments` | `POST /v1/search` → `GET /v1/comments` |
+| `users` | `GET /v1/users` |
+| `file_uploads` | `GET /v1/file_uploads` |
 
-| Object | Description | Incremental |
-|--------|-------------|-------------|
-| `pages` | Page content and metadata | Yes |
-| `data_sources` | Tables of data that live under a Notion database | Yes |
-| `blocks` | Block content within pages | Yes |
-| `users` | Workspace users | No (snapshot) |
-| `comments` | Page/block comments | Yes |
+---
 
-**Object List Retrieval**: Objects are discovered via the `/search` endpoint which returns pages and data_sources.
+## Read endpoints
 
-## Object Schema
+### `POST /v1/search` — pages and data sources
 
-### Pages Schema
-
-Pages contain properties (custom fields) and content blocks. The properties structure is dynamic based on the page template.
-
-**Key Fields**:
-- `id`: Unique page identifier
-- `url`: Full URL to the page
-- `properties`: Object containing page properties (title, date, people, etc.)
-- `parent`: Parent reference (workspace, page, or database)
-- `created_time`: ISO 8601 timestamp
-- `last_edited_time`: ISO 8601 timestamp
-- `archived`: Boolean indicating if page is archived
-
-### Datasources Schema
-
-Datasources define structured data with property templates.
-
-**Key Fields**:
-- `id`: Unique data_source identifier
-- `title`: Array of rich text objects
-- `properties`: Property definitions with types
-- `parent`: Parent reference
-- `created_time`: ISO 8601 timestamp
-- `last_edited_time`: ISO 8601 timestamp
-
-### Blocks Schema
-
-Blocks represent content units within pages.
-
-**Block Types**:
-- `paragraph`, `heading_1`, `heading_2`, `heading_3`
-- `bulleted_list_item`, `numbered_list_item`
-- `to_do`, `toggle`, `child_page`, `child_database`
-- `image`, `video`, `file`, `pdf`, `bookmark`
-- `code`, `quote`, `divider`, `callout`
-- `embed`, `link_preview`, `table`, `table_row`
-
-**Key Fields**:
-- `id`: Unique block identifier
-- `type`: Block type string
-- `has_children`: Boolean for nested blocks
-- `created_time`, `last_edited_time`: Timestamps
-
-### Users Schema
-
-**Key Fields**:
-- `id`: Unique user identifier
-- `name`: Display name
-- `avatar_url`: URL to avatar image
-- `type`: `person` or `bot`
-- `person.email`: Email address (for person type)
-- `bot.owner`: Owner information (for bot type)
-
-### Comments Schema
-
-**Key Fields**:
-- `id`: Unique comment identifier
-- `parent`: Reference to page or block
-- `discussion_id`: Discussion thread identifier
-- `created_by`: User object who created comment
-- `created_time`: ISO 8601 timestamp
-- `rich_text`: Array of comment content
-
-## Get Object Primary Keys
-
-All Notion objects use a consistent primary key pattern:
-
-| Object | Primary Key |
-|--------|-------------|
-| `pages` | `id` |
-| `data_sources` | `id` |
-| `blocks` | `id` |
-| `users` | `id` |
-| `comments` | `id` |
-| `data_sources` | `id` |
-
-The `id` field is a UUID string returned in every API response.
-
-## Object's Ingestion Type
-
-| Object | Ingestion Type | Cursor Field |
-|--------|----------------|--------------|
-| `pages` | `cdc` | `last_edited_time` |
-| `data_sources` | `cdc` | `last_edited_time` |
-| `blocks` | `cdc` | `last_edited_time` |
-| `users` | `snapshot` | N/A |
-| `comments` | `cdc` | `created_time` |
-| `data_sources` | `cdc` | `last_edited_time` |
-
-- **`cdc`**: Incremental sync with upserts using `last_edited_time` or `created_time`
-- **`snapshot`**: Full refresh only (users don't have incremental updates)
-
-## Read API for Data Retrieval
-
-### Search Endpoint (Pages & Data_sources)
-
-**Endpoint**: `POST /search`
-
-**Purpose**: Discover pages and data_sources accessible to the integration.
-
-**Request Body**:
 ```json
 {
-  "filter": {
-    "property": "object",
-    "value": "page"
-  },
-  "sort": {
-    "direction": "descending",
-    "timestamp": "last_edited_time"
-  },
+  "filter": {"property": "object", "value": "page"},
+  "sort": {"direction": "ascending", "timestamp": "last_edited_time"},
   "page_size": 100,
-  "start_cursor": "..."
+  "start_cursor": "<opaque>"
 }
 ```
 
-**Response**:
+| Field | Values |
+|---|---|
+| `filter.value` | `page`, `data_source` |
+| `sort.timestamp` | `last_edited_time` |
+| `sort.direction` | `ascending`, `descending` |
+| `page_size` | 1–100 (default 100) |
+
+**Critical limitation: search has no time filter.** You can *sort* by
+`last_edited_time` but you cannot bound it. There is no `since`/`until`, no
+`filter` on timestamps, nothing. Consequences:
+
+1. Incremental reads must re-walk the sort from the beginning and skip
+   client-side. The connector sorts **ascending** so that once it passes the
+   previous watermark, every remaining record is new.
+2. The connector cannot be partitioned across executors — there is no way to
+   hand each one a self-contained slice of the range.
+
+### `GET /v1/databases/{database_id}`
+
+Container object. Post-`2025-09-03` it holds presentation and structure only —
+the property schema and the rows live on the data sources it points at.
+
+```json
+{
+  "object": "database", "id": "…",
+  "title": [...], "description": [...],
+  "icon": {...}, "cover": {...},
+  "is_inline": false, "is_locked": false, "in_trash": false,
+  "parent": {"type": "workspace", "workspace": true},
+  "data_sources": [{"id": "…", "name": "…"}],
+  "url": "…", "public_url": "…",
+  "created_time": "…", "last_edited_time": "…"
+}
+```
+
+### `GET /v1/data_sources/…` and search results
+
+The data source carries `properties` (the column schema), `title`,
+`description`, `is_inline`, and `parent` / `database_parent` pointing back at
+its container.
+
+### `GET /v1/views` — the Views API
+
+**The path is `/v1/views`, not `/v1/data_sources/{id}/views`.**
+
+| Param | Notes |
+|---|---|
+| `data_source_id` | one of these two is **required** |
+| `database_id` | " |
+| `start_cursor`, `page_size` | standard pagination |
+
+The listing returns **partial** objects — `object`, `id`, `parent`, `type` and
+nothing else. Each must be hydrated with `GET /v1/views/{view_id}` to get
+`name`, `filter`, `sorts`, `quick_filters`, `configuration`, timestamps.
+
+Full view object:
+
+```json
+{
+  "object": "view", "id": "…",
+  "name": "By status",
+  "type": "table|board|list|calendar|timeline|gallery|form|chart|map|dashboard",
+  "parent": {"type": "database_id", "database_id": "…"},
+  "data_source_id": "…",
+  "filter": {...}, "sorts": [...],
+  "quick_filters": {...}, "configuration": {...},
+  "dashboard_view_id": "…",
+  "url": "…", "created_time": "…", "last_edited_time": "…",
+  "created_by": {...}, "last_edited_by": {...}
+}
+```
+
+Views are the closest analogue Notion has to a "pipeline" in a CRM: they are
+the saved filter/sort definitions describing how a data source is segmented.
+
+### `GET /v1/blocks/{block_id}/children`
+
+Returns the direct children of a page or block. **Not recursive** — any child
+with `has_children: true` needs its own call. The connector walks depth-first
+with a configurable depth limit (`max_block_depth`, default 5) so a
+pathologically nested page cannot stall a microbatch.
+
+Block types (one column each in the `blocks` table):
+
+```
+audio, bookmark, breadcrumb, bulleted_list_item, callout, child_database,
+child_page, code, column, column_list, divider, embed, equation, file,
+heading_1, heading_2, heading_3, heading_4, image, link_preview,
+link_to_page, meeting_notes, numbered_list_item, paragraph, pdf, quote,
+synced_block, table, table_of_contents, table_row, tab, template, to_do,
+toggle, transcription, unsupported, video
+```
+
+**`meeting_notes`** (new in `2026-03-11`, previously `transcription`) carries
+AI meeting-note metadata:
+
+```json
+{
+  "title": [...rich text...],
+  "status": "transcription_not_started|transcription_in_progress|notes_ready",
+  "children": {"summary_block_id": "…", "notes_block_id": "…",
+               "transcript_block_id": "…"},
+  "calendar_event": {"start_time": "…", "end_time": "…", "attendees": [...]},
+  "recording": {"start_time": "…", "end_time": "…"}
+}
+```
+
+### `GET /v1/comments`
+
+Requires `block_id` (a page id works — a page *is* a block). Returns the
+comment threads on that block. There is no workspace-wide comment listing.
+
+### `GET /v1/users`
+
+Flat list of members and bots. No timestamps at all, hence snapshot ingestion.
+
+### `GET /v1/file_uploads`
+
+| Param | Notes |
+|---|---|
+| `status` | `pending`, `uploaded`, `expired`, `failed` |
+| `start_cursor`, `page_size` | 1–100 |
+
+**This endpoint really does enumerate.** Unlike most attachment APIs (and
+unlike HubSpot's engagement attachments, which have no batch endpoint), you do
+not have to scrape ids out of blocks and resolve them one at a time. One list
+walk gets every upload the integration owns, with `filename`, `content_type`,
+`content_length`, `status`, `expiry_time` and timestamps already hydrated.
+
+Caveat: the endpoint covers files *uploaded through the API*. Files attached
+by external URL, and Notion-hosted files predating the File Upload API, appear
+in block/property payloads but not in this list.
+
+No documented sort order, so the connector buffers and sorts by
+`last_edited_time` itself before applying its watermark.
+
+### `GET /v1/pages/{page_id}/properties/{property_id}`
+
+The repair endpoint for truncated page properties — see below.
+
+---
+
+## Page property truncation
+
+**This is the most important correctness hazard in the Notion API.**
+
+A page object does not always contain its complete property values. Five
+property types are paginated:
+
+`title`, `rich_text`, `relation`, `people`, `rollup`
+
+For these, the page object returns **at most 25 entries**, and rollups that
+need more than one aggregation pass return `{"type": "incomplete"}` instead of
+a value. A consumer that reads `page.properties` directly and stops there
+silently loses data on every heavily-linked page.
+
+### Detecting truncation
+
+Notion signals it three different ways, and sometimes not at all:
+
+| Signal | Applies to |
+|---|---|
+| `has_more: true` on the property | relation, people, rich_text |
+| `rollup.type == "incomplete"` | rollup |
+| *(nothing)* — array is just capped at 25 | any paginated type |
+
+Because of the third case the connector also treats "exactly 25 items" as
+suspect and re-resolves. A false positive costs one extra API call; a false
+negative loses data.
+
+### Repairing it
+
+`GET /v1/pages/{page_id}/properties/{property_id}` returns a paginated list of
+`property_item` objects:
+
 ```json
 {
   "object": "list",
-  "results": [...],
-  "has_more": true,
-  "next_cursor": "..."
+  "type": "property_item",
+  "results": [{"object": "property_item", "type": "relation",
+               "relation": {"id": "…"}}, ...],
+  "property_item": {"id": "…", "type": "relation", "next_url": null},
+  "next_cursor": "…",
+  "has_more": true
 }
 ```
 
-**Pagination**: Cursor-based using `start_cursor` and `next_cursor`.
+For rollups the aggregate arrives on a trailing `property_item` of type
+`rollup`; the other items are the rolled-up values.
 
-### Users Endpoint
+### Design decision: resolve inline
 
-**Endpoint**: `GET /users`
+The connector **resolves truncated properties in place** before emitting the
+page row, rather than emitting an overflow table.
 
-**Purpose**: List all users in the workspace.
+Why inline:
 
-**Query Parameters**:
-- `page_size`: 1-100 (default: 100)
-- `start_cursor`: Pagination cursor
+- One row per page. No join is needed to read a relation, which is what
+  makes the difference between "the data is there" and "the data is usable".
+- The alternative — a `page_properties` child table — would force every
+  consumer to join for correctness, and would make a *partially* truncated
+  page (2 of 40 properties overflowing) split across two tables with no
+  obvious signal about which properties to look for where.
+- Resolution is opportunistic: the API calls only fire for properties that
+  actually came back truncated, which is a small minority of pages.
 
-**Response**:
-```json
-{
-  "object": "list",
-  "results": [...],
-  "has_more": true,
-  "next_cursor": "..."
-}
-```
+The costs, accepted knowingly:
 
-### Comments Endpoint
+- **Extra API calls.** One paginated walk per truncated property per page.
+  Disable with `resolve_truncated_properties: "false"` if you do not need
+  complete relations and are hitting rate limits.
+- **Unbounded row width.** A relation with 50,000 entries would produce a
+  huge cell. Bounded by `max_property_items` (default 1000); when the cap
+  bites, the emitted property keeps `has_more: true` so the truncation stays
+  visible rather than looking complete.
 
-**Endpoint**: `GET /comments`
+Two schema consequences:
 
-**Purpose**: Retrieve comments on a page or block.
+1. `pages.properties` is `MAP<STRING, STRING>` where each **value is JSON**.
+   Property values are recursive (a relation is an array of objects, a rollup
+   wraps an aggregate); no flat Spark map can hold them, and the previous
+   `MAP<STRING, MAP<STRING, STRING>>` typing silently mangled them.
+2. `pages.truncated_properties` is `ARRAY<STRING>` listing the property names
+   that were re-fetched — an audit trail for which rows took the slow path.
 
-**Query Parameters**:
-- `block_id`: Required - ID of the block to get comments for
-- `page_id`: Alternative - ID of the page
-- `page_size`: 1-100
-- `start_cursor`: Pagination cursor
+---
 
-**Response**:
-```json
-{
-  "object": "list",
-  "results": [...],
-  "has_more": true,
-  "next_cursor": "..."
-}
-```
+## Incremental sync strategy
 
-### Blocks Endpoint
+Because search has no time filter, every CDC table works the same way:
 
-**Endpoint**: `GET /blocks/{block_id}/children`
+1. Walk the source in **ascending** watermark order.
+2. Skip records at or below the offset's `cursor`.
+3. Stop at the first record newer than `self._init_ts` (the connector's
+   construction time). This cap is what terminates `Trigger.AvailableNow`:
+   without it a busy workspace would keep producing new records forever.
+4. Stop once `max_records_per_batch` rows are collected.
+5. Return the last watermark consumed. Returning the *same* offset that came
+   in is the "no more data" signal.
 
-**Purpose**: Retrieve child blocks of a page or block.
+### Watermark vs. cursor field for derived tables
 
-**Path Parameters**:
-- `block_id`: Parent block ID
+`blocks` and `comments` are checkpointed on the **parent page's**
+`last_edited_time`, not the block's or comment's own.
 
-**Query Parameters**:
-- `page_size`: 1-100
-- `start_cursor`: Pagination cursor
+This is deliberate. Notion bumps a page's `last_edited_time` whenever any
+block on it changes, so the page timestamp is a complete and monotonically
+ordered gate for the crawl. Individual block timestamps are *not* ordered with
+respect to each other across pages — using them as the offset would make the
+watermark jump backwards and re-read or skip arbitrarily.
 
-**Response**:
-```json
-{
-  "object": "list",
-  "results": [...],
-  "has_more": true,
-  "next_cursor": "..."
-}
-```
+The table metadata still declares `cursor_field: last_edited_time` (the
+block's own), because that is the correct key for the downstream CDC merge.
+The offset and the merge cursor are answering different questions.
 
-### Datasources Query Endpoint
+`databases` and `views` are similarly checkpointed on the owning **data
+source's** `last_edited_time`.
 
-**Endpoint**: `POST /search`
+---
 
-**Purpose**: Query data_sources contents with filters and sorts.
+## Field type mapping
 
-**Request Body**:
-```json
-{
-  "filter": {...},
-  "sorts": [...],
-  "page_size": 100,
-  "start_cursor": "..."
-}
-```
+| Notion type | Spark type |
+|---|---|
+| id / url / ISO 8601 timestamp | `StringType` |
+| boolean | `BooleanType` |
+| `content_length` (bytes) | `LongType` |
+| nested object (`parent`, `icon`, `cover`, `created_by`, block content) | `MapType(StringType, StringType)` |
+| array of objects (`title`, `rich_text`, `data_sources`) | `ArrayType(MapType(StringType, StringType))` |
+| page/data-source `properties` | `MapType(StringType, StringType)`, values JSON |
+| view `filter` / `sorts` / `configuration` | `StringType`, JSON |
 
-**Response**: Same pagination structure as search.
+### Special field behaviours
 
-### Incremental Sync Strategy
+- **Nested map values are JSON-encoded.** `cover` arrives as
+  `{"type": "external", "external": {"url": "…"}}` — a two-level structure a
+  string map cannot hold. Scalars pass through unquoted (`parent["type"]`
+  reads as `database_id`, not `"database_id"`), objects and arrays are
+  JSON-encoded.
+- **`archived` / `in_trash`.** Read under both names for version portability;
+  exposed as `in_trash`.
+- **Block type union.** Every block type gets its own column; only the one
+  matching the row's `type` is non-null.
 
-**Cursor Field**: `last_edited_time` for pages/data_sources/blocks, `created_time` for comments.
+---
 
-**Incremental Query Pattern**:
-1. Store the max `last_edited_time` from previous sync
-2. Query with `sort: {direction: "descending", timestamp: "last_edited_time"}`
-3. Filter results client-side: `record.last_edited_time >= last_sync_time`
-4. Update cursor to max `last_edited_time` from current batch
+## Rate limits
 
-**Lookback Window**: Apply a 5-second lookback to catch concurrently updated records:
-```
-start_time = last_cursor - 5 seconds
-```
+- ~3 requests/second average, with bursts tolerated.
+- `429` responses carry `Retry-After` (seconds).
+- The connector retries `429`, `500`, `502`, `503`, `504` up to 5 times,
+  honouring `Retry-After` and otherwise backing off exponentially.
+- `403`/`404` are treated as "not shared with this integration" and skipped
+  rather than failing the read — one unshared page should not abort a sync.
 
-**Rate Limits**: 
-- Approximately 3 requests per second per integration
-- 429 status code on rate limit exceeded
-- Retry after `retry-after` header value
+The graph walk multiplies request counts: `blocks` costs roughly one request
+per page plus one per nested container. Tune `max_records_per_batch` and
+`max_block_depth` if you approach the limit.
 
-## Field Type Mapping
+---
 
-| Notion Type | Spark Type | Notes |
-|-------------|------------|-------|
-| `string` | `StringType` | Text values |
-| `number` | `DoubleType` | Numeric values |
-| `boolean` | `BooleanType` | True/false |
-| `date` | `StringType` | ISO 8601 format |
-| `datetime` | `StringType` | ISO 8601 format |
-| `email` | `StringType` | Email addresses |
-| `phone_number` | `StringType` | Phone numbers |
-| `url` | `StringType` | URLs |
-| `rich_text` | `ArrayType(MapType)` | Array of text objects |
-| `people` | `ArrayType(MapType)` | Array of user references |
-| `files` | `ArrayType(MapType)` | Array of file objects |
-| `relation` | `ArrayType(MapType)` | Array of related page IDs |
-| `rollup` | `MapType` | Aggregated values |
-| `select` | `MapType` | Single select option |
-| `multi_select` | `ArrayType(MapType)` | Multiple select options |
-| `status` | `MapType` | Status field |
-| `created_time` | `StringType` | ISO 8601 timestamp |
-| `last_edited_time` | `StringType` | ISO 8601 timestamp |
-| `created_by` | `MapType` | User object |
-| `last_edited_by` | `MapType` | User object |
-| `archived` | `BooleanType` | Archive status |
+## Known quirks
 
-### Special Field Behaviors
+1. **Search cannot filter by time.** Sort only. Every incremental read
+   re-walks and skips client-side.
+2. **Search cannot return databases.** Only `page` and `data_source`.
+3. **`GET /v1/views` returns partial objects.** Hydration is mandatory.
+4. **Page properties truncate silently at 25 items.** See above.
+5. **Users have no timestamps**, so `users` can only be a snapshot.
+6. **Comments need a parent block id**; there is no global comment list.
+7. **Block children are one level deep** per call.
+8. **Unshared content is invisible, not forbidden.** An empty table usually
+   means a sharing problem, not an auth problem.
 
-- **`properties`**: Dynamic structure based on page/database template. Each property has a type and value.
-- **`rich_text`**: Array of objects with `text`, `plain_text`, `href` fields.
-- **`parent`**: Object with `type` (workspace/page/database) and `id` or `workspace` boolean.
-- **`url`**: Full Notion URL to the resource.
+---
 
-## Rate Limits
+## Sources and references
 
-- **Limit**: ~3 requests per second per integration
-- **Exceeded**: HTTP 429 Too Many Requests
-- **Retry**: Use `retry-after` header value (in seconds)
-- **Recommendation**: Implement exponential backoff with max 3 retries
-
-## Sources and References
-
-| Source Type | URL | Confidence | What it confirmed |
-|-------------|-----|------------|-------------------|
-| Official Notion API Docs | https://developers.notion.com/ | Highest | All endpoints, auth, pagination |
-| Airbyte Notion Connector | https://github.com/airbytehq/airbyte/tree/master/airbyte-integrations/connectors/source-notion | High | Stream definitions, schemas, incremental logic |
-| Airbyte Manifest | manifest.yaml | High | Pagination config, error handling, field mappings |
-
-## Research Log
-
-| Source Type | URL | Accessed (UTC) | Confidence | What it confirmed |
-|-------------|-----|----------------|------------|-------------------|
-| Official Docs | https://developers.notion.com/reference | 2026-07-21 | High | API structure, auth, rate limits |
-| Airbyte Connector | https://github.com/airbytehq/airbyte/tree/master/airbyte-integrations/connectors/source-notion | 2026-07-21 | High | Stream configs, schemas |
-| Airbyte Manifest | https://raw.githubusercontent.com/airbytehq/airbyte/master/airbyte-integrations/connectors/source-notion/manifest.yaml | 2026-07-21 | High | Pagination, error handling |
-
-## Known Quirks
-
-1. **Dynamic Properties**: Page/database properties are schema-less and vary by template. The connector must handle arbitrary property structures.
-
-2. **Block Hierarchy**: Blocks can have nested children (up to 30 levels deep). Recursive fetching is required for complete content.
-
-3. **Permission Errors**: 404 with "Make sure the relevant pages and data_sources are shared with your integration" should be ignored (not a connector error).
-
-4. **Invalid Cursor**: 400 with "The start_cursor provided is invalid" should be handled gracefully (cursor expiration).
-
-5. **Users Stream**: Requires explicit "Read user information" permission in Notion integration settings.
-
-6. **Timestamp Format**: All timestamps use ISO 8601 format: `YYYY-MM-DDTHH:MM:SS.000Z`
+- Notion API reference — <https://developers.notion.com/reference/intro>
+- Upgrade guide, `2025-09-03` (database / data source split) —
+  <https://developers.notion.com/docs/upgrade-guide-2025-09-03>
+- Upgrade guide, `2026-03-11` (`in_trash`, `meeting_notes`) —
+  <https://developers.notion.com/docs/upgrade-guide-2026-03-11>
+- Working with views — <https://developers.notion.com/guides/data-apis/working-with-views>
+- List views — <https://developers.notion.com/reference/list-views>
+- Retrieve a view — <https://developers.notion.com/reference/retrieve-a-view>
+- List file uploads — <https://developers.notion.com/reference/list-file-uploads>
+- File upload object — <https://developers.notion.com/reference/file-upload>
+- Retrieve a page property item — <https://developers.notion.com/reference/retrieve-a-page-property>
+- Search by title — <https://developers.notion.com/reference/post-search>
+- Block object — <https://developers.notion.com/reference/block>

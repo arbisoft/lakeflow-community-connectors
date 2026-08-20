@@ -1,0 +1,74 @@
+[
+  {
+    "object": "file_upload",
+    "id": "99999999-0001-4000-8000-000000000001",
+    "filename": "quarterly-report.pdf",
+    "content_type": "application/pdf",
+    "content_length": 482913,
+    "status": "uploaded",
+    "mode": "single_part",
+    "expiry_time": "2026-01-26T06:00:00.000Z",
+    "created_time": "2026-01-09T06:00:00.000Z",
+    "last_edited_time": "2026-01-18T06:00:00.000Z",
+    "created_by": {
+      "object": "user",
+      "id": "22222222-2222-4222-8222-222222222222"
+    },
+    "file_import_result": {
+      "type": "success",
+      "imported_time": "2026-01-18T07:00:00.000Z"
+    },
+    "number_of_parts": {
+      "total": 1,
+      "sent": 1
+    }
+  },
+  {
+    "object": "file_upload",
+    "id": "99999999-0002-4000-8000-000000000002",
+    "filename": "diagram.png",
+    "content_type": "image/png",
+    "content_length": 20481,
+    "status": "uploaded",
+    "mode": "single_part",
+    "expiry_time": "2026-01-27T06:00:00.000Z",
+    "created_time": "2026-01-10T06:00:00.000Z",
+    "last_edited_time": "2026-01-19T06:00:00.000Z",
+    "created_by": {
+      "object": "user",
+      "id": "22222222-2222-4222-8222-222222222222"
+    },
+    "file_import_result": {
+      "type": "success",
+      "imported_time": "2026-01-19T07:00:00.000Z"
+    },
+    "number_of_parts": {
+      "total": 1,
+      "sent": 1
+    }
+  },
+  {
+    "object": "file_upload",
+    "id": "99999999-0003-4000-8000-000000000003",
+    "filename": "archive.zip",
+    "content_type": "application/zip",
+    "content_length": 10485760,
+    "status": "pending",
+    "mode": "multi_part",
+    "expiry_time": "2026-01-28T06:00:00.000Z",
+    "created_time": "2026-01-11T06:00:00.000Z",
+    "last_edited_time": "2026-01-20T06:00:00.000Z",
+    "created_by": {
+      "object": "user",
+      "id": "22222222-2222-4222-8222-222222222222"
+    },
+    "file_import_result": {
+      "type": "success",
+      "imported_time": "2026-01-20T07:00:00.000Z"
+    },
+    "number_of_parts": {
+      "total": 4,
+      "sent": 1
+    }
+  }
+]

@@ -1,56 +1,89 @@
-# Notion Simulator Spec
-# This file defines the API endpoints for the Notion simulator
+# Notion simulator spec.
+#
+# Every endpoint routes to a custom handler. Two properties of the Notion
+# API put it outside the declarative param-role pipeline:
+#
+#   * Pagination is opaque-cursor (``start_cursor`` in, ``next_cursor`` /
+#     ``has_more`` out). The built-in styles only cover page-number and
+#     offset-limit.
+#   * The API is a graph. ``POST /v1/search`` chooses its corpus from a
+#     filter in the request *body*; block children, comments, views and page
+#     properties are keyed by a parent id from the path or query string.
+#     Those are joins, not filters.
+#
+# So `pagination_style` / `params` are unused here; see handlers/notion_api.py.
+# Future-record synthesis for cap testing is likewise done in the handler
+# (``_augment_with_future``) rather than via ``synthesize_future_records``,
+# which the declarative pipeline would apply but a custom handler bypasses.
 
 endpoints:
-  # Search endpoint (POST) - used for pages and data_sources incremental reads
-  - path: /v1/search
+  # ------------------------------------------------------------------
+  # Roots — the only three things Notion lets you enumerate directly.
+  # ------------------------------------------------------------------
+
+  # Pages and data sources. `filter.value` in the body selects which.
+  # Backs the `pages` and `data_sources` tables, and is the entry point
+  # for `databases`, `views`, `blocks` and `comments`.
+  - path: "/v1/search"
     method: POST
-    corpus: search_results
-    response:
-      pagination_style: offset_limit
-      cursor_field: next_cursor
-      has_more_field: has_more
-      wrapper:
-        records_key: results
-    synthesize_future_records:
-      cursor_field: last_edited_time
-      count: 3
+    corpus: pages
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:search
 
-  # Users endpoint (GET) - snapshot table
-  - path: /v1/users
+  # Workspace members and bots — the `users` table (snapshot).
+  - path: "/v1/users"
     method: GET
-    corpus: users_list
-    response:
-      pagination_style: offset_limit
-      cursor_field: next_cursor
-      has_more_field: has_more
-      wrapper:
-        records_key: results
+    corpus: users
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:users
 
-  # Blocks children endpoint (GET)
-  - path: /v1/blocks/{block_id}/children
+  # Uploaded files — the `file_uploads` table. Unlike most attachment
+  # APIs this one really does enumerate, so the connector never has to
+  # hydrate ids scraped out of blocks one at a time.
+  - path: "/v1/file_uploads"
     method: GET
-    corpus: blocks_children
-    response:
-      pagination_style: offset_limit
-      cursor_field: next_cursor
-      has_more_field: has_more
-      wrapper:
-        records_key: results
-    synthesize_future_records:
-      cursor_field: last_edited_time
-      count: 3
+    corpus: file_uploads
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:file_uploads
 
-  # Comments endpoint (GET)
-  - path: /v1/comments
+  # ------------------------------------------------------------------
+  # Reached by walking out from a root.
+  # ------------------------------------------------------------------
+
+  # Database containers. Not searchable — the connector finds these via
+  # `data_source.parent.database_id` and hydrates each one here.
+  - path: "/v1/databases/{database_id}"
     method: GET
-    corpus: comments_list
-    response:
-      pagination_style: offset_limit
-      cursor_field: next_cursor
-      has_more_field: has_more
-      wrapper:
-        records_key: results
-    synthesize_future_records:
-      cursor_field: created_time
-      count: 3
+    corpus: databases
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:retrieve_database
+
+  # View references for one data source. Returns *partial* objects
+  # (object/id/parent/type only), matching the real API.
+  - path: "/v1/views"
+    method: GET
+    corpus: views
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:list_views
+
+  # Full view object — the hydration step after /v1/views.
+  - path: "/v1/views/{view_id}"
+    method: GET
+    corpus: views
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:retrieve_view
+
+  # Block tree. Corpus blocks carry real parent pointers, so the
+  # connector's recursive descent is genuinely exercised.
+  - path: "/v1/blocks/{block_id}/children"
+    method: GET
+    corpus: blocks
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:block_children
+
+  # Comment thread hanging off one block or page.
+  - path: "/v1/comments"
+    method: GET
+    corpus: comments
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:comments
+
+  # Overflow items for a page property that the page object truncated at
+  # 25 entries. Corpus keys are "{page_id}:{property_id}"; served 5 at a
+  # time so the connector's pagination through the item list is covered.
+  - path: "/v1/pages/{page_id}/properties/{property_id}"
+    method: GET
+    corpus: page_properties
+    handler: databricks.labs.community_connector.source_simulator.specs.notion.handlers.notion_api:page_property

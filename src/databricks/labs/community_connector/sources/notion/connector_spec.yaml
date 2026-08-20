@@ -20,6 +20,18 @@ connection:
         This token starts with "secret_" and can be obtained from the
         Notion Developer Portal at https://www.notion.so/my-integrations.
 
+    - name: notion_version
+      type: string
+      required: false
+      secret: false
+      description: >
+        Value sent in the Notion-Version header. Defaults to 2026-03-11,
+        which is the minimum version supporting the Views API,
+        GET /v1/file_uploads, and the meeting_notes block type. Pin to an
+        earlier version (e.g. 2025-09-03) only if you need the older
+        response shapes; the views table and the meeting_notes block
+        column will be empty on those versions.
+
 # ============================================================================
 # External Options Allowlist
 # These table-specific options must be included in the externalOptionsAllowList
@@ -27,5 +39,9 @@ connection:
 # Use a comma-separated string of option names.
 # If no table-specific options are needed, set to empty string or omit.
 # ============================================================================
-# The Notion connector does not use any table-specific options.
-external_options_allowlist: ""
+#   max_records_per_batch          - rows per microbatch (all CDC tables)
+#   resolve_truncated_properties   - repair >25-item page properties (pages)
+#   max_property_items             - cap on items pulled for one property (pages)
+#   max_block_depth                - recursion depth of the block crawl (blocks)
+#   file_upload_status             - filter uploads by status (file_uploads)
+external_options_allowlist: "max_records_per_batch,resolve_truncated_properties,max_property_items,max_block_depth,file_upload_status"

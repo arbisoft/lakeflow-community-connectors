@@ -1,47 +1,24 @@
 [
   {
     "object": "user",
-    "id": "user-001",
-    "name": "John Doe",
-    "avatar_url": "https://lh3.googleusercontent.com/a-/avatar1",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "name": "Ada Lovelace",
+    "avatar_url": "https://example.com/avatar-ada.png",
     "type": "person",
     "person": {
-      "email": "john.doe@example.com"
+      "email": "ada@example.com"
     }
   },
   {
     "object": "user",
-    "id": "user-002",
-    "name": "Jane Smith",
-    "avatar_url": "https://lh3.googleusercontent.com/a-/avatar2",
-    "type": "person",
-    "person": {
-      "email": "jane.smith@example.com"
-    }
-  },
-  {
-    "object": "user",
-    "id": "user-003",
-    "name": "Bob Wilson",
-    "avatar_url": null,
-    "type": "person",
-    "person": {
-      "email": "bob.wilson@example.com"
-    }
-  },
-  {
-    "object": "user",
-    "id": "bot-001",
-    "name": "Notion Bot",
-    "avatar_url": null,
+    "id": "22222222-2222-4222-8222-222222222222",
+    "name": "Ingest Bot",
+    "avatar_url": "https://example.com/avatar-bot.png",
     "type": "bot",
     "bot": {
       "owner": {
-        "type": "user",
-        "user": {
-          "object": "user",
-          "id": "user-001"
-        }
+        "type": "workspace",
+        "workspace": true
       },
       "workspace_name": "Example Workspace"
     }
