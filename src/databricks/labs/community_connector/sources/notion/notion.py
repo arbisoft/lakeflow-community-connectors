@@ -209,19 +209,36 @@ class NotionLakeflowConnect(LakeflowConnect):
     # ------------------------------------------------------------------
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """Issue an API request, retrying on 429 and 5xx with backoff."""
+        """Issue an API request, retrying on 429, 5xx, and connection-level
+        failures (timeouts, dropped connections) with backoff.
+
+        A read/connect timeout raises inside ``requests`` before a response
+        ever exists, so it can't be handled by checking ``resp.status_code``
+        like the retriable-status path below -- it has to be caught
+        separately, or one transient network blip kills the whole streaming
+        query instead of just costing a retry.
+        """
         kwargs.setdefault("timeout", 30)
         backoff = 1.0
         resp = None
+        last_error: Optional[requests.exceptions.RequestException] = None
 
         for attempt in range(_MAX_RETRIES):
             url = f"{self.base_url}/{path.lstrip('/')}"
-            if method == "GET":
-                resp = requests.get(url, headers=self.headers, **kwargs)
-            elif method == "POST":
-                resp = requests.post(url, headers=self.headers, **kwargs)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+            try:
+                if method == "GET":
+                    resp = requests.get(url, headers=self.headers, **kwargs)
+                elif method == "POST":
+                    resp = requests.post(url, headers=self.headers, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                resp = None
+                if attempt < _MAX_RETRIES - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                continue
 
             if resp.status_code not in _RETRIABLE_STATUS_CODES:
                 return resp
@@ -233,6 +250,8 @@ class NotionLakeflowConnect(LakeflowConnect):
                 time.sleep(float(delay) if delay else backoff)
                 backoff *= 2
 
+        if resp is None and last_error is not None:
+            raise last_error
         return resp
 
     def _get_json(
