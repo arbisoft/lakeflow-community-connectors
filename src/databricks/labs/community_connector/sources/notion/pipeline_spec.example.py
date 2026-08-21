@@ -75,13 +75,16 @@ pipeline_spec = {
                 "source_table": "views",
             }
         },
-        # Full config example: page content blocks, recursive crawl depth capped
+        # Full config example: page content blocks, recursive crawl depth capped.
+        # destination_catalog/schema are shown here for reference -- set them
+        # explicitly only if this table needs to land somewhere different
+        # from the pipeline's default target; omit them (like the other
+        # tables above) to just use the pipeline default.
         {
             "table": {
                 "source_table": "blocks",
                 "destination_catalog": "<YOUR_CATALOG>",
                 "destination_schema": "<YOUR_SCHEMA>",
-                "destination_table": "notion_blocks",
                 "table_configuration": {
                     "scd_type": "SCD_TYPE_1",
                     "max_block_depth": "5",
